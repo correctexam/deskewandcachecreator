@@ -1,0 +1,3 @@
+[submodule "akaze"]
+	path = akaze
+	url = https://github.com/barais/akaze
