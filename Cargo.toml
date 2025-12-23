@@ -1,0 +1,26 @@
+[package]
+name = "pdf_to_webp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Utilise les bindings PDFium pour le rendu de pages en image (DynamicImage)
+pdfium = { version = "0.9.5" }
+# Crate pour la manipulation de DynamicImage
+image = "0.25"
+# Crate pour l'encodage WebP (nécessite libwebp-sys)
+webp = "0.2"
+# Pour les arguments de ligne de commande
+clap = { version = "4.5", features = ["derive"] }
+# Pour créer des répertoires
+#std_extra = "0.1.0"
+# imageproc= "0.25.0"
+rand = "0.9.2"
+nalgebra = "0.34.1" 
+
+#akaze = "0.7"       # Implémentation pure Rust de AKAZE
+
+rayon = "1.11.0"
+
+[dependencies.akaze]
+path = "./akaze"
