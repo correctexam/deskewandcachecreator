@@ -1,17 +1,12 @@
 use base64::{Engine as _, engine::general_purpose};
-use image::{DynamicImage, EncodableLayout, Pixel, RgbImage}; // Importez RgbImage si vous l'utilisez souvent
+use image::{DynamicImage, EncodableLayout}; // Importez RgbImage si vous l'utilisez souvent
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
 use core::result::Result;
-// Si vous utilisez encore le code de deskew précédent :
-// use nalgebra::{Matrix3, Vector2, Vector3, Vector4};
-// use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
-// use rayon::prelude::*;
-// use akaze::Akaze; // Ou votre impl custom...
 
 // Pour la partie DB :
-use webp::{Encoder, WebPImage}; // Ajout de la crate webp
+use webp::{Encoder}; // Ajout de la crate webp
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "details", rename_all = "lowercase")]
@@ -86,7 +81,7 @@ pub fn save_image_to_db_webp(
     conn: &Connection,
     img: &DynamicImage,
     page: &i32,
-    state: ImageState,
+    state: ImageState
 ) -> Result<(), rusqlite::Error> {
     // --- 1. Préparation des données pour l'encodeur WebP ---
     // L'encodeur webp prend des données Rgba8 ou Rgb8.
@@ -148,3 +143,4 @@ pub fn save_image_to_db_webp(
 
     Ok(())
 }
+

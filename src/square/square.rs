@@ -14,13 +14,6 @@ pub struct Circle {
     pub r: f32,
 }
 
-#[derive(Clone)]
-pub struct KeyPoint {
-    pub x: f32,
-    pub y: f32,
-    pub angle: f32,
-    pub desc: [u8; 32], // 256 bits
-}
 
 
 #[derive(Debug)]

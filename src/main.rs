@@ -5,9 +5,8 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::{Path};
 mod akazeai;
-mod akazeopenai;
 mod s3fs;
 mod sqliteutils;
 mod square;
@@ -90,7 +89,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .collect()
     };
 
-    let t = process_exam(
+    let _ = process_exam(
         pages_to_manage,
         args.exam_id as u32,
         args.template_id as u32,
@@ -164,9 +163,6 @@ fn process_exam(
     let templatedata = template.bytes().to_vec();
     let cursor = Cursor::new(templatedata);
     let document_template = PdfiumDocument::new_from_reader(cursor, None).unwrap();
-    //    let document_template = PdfiumDocument::new_from_reader(pdf_template_path, None).unwrap();
-
-    // let document_template = PdfiumDocument::new_from_path(pdf_template_path, None).unwrap();
     let scan = get_object(
         server_url,
         bucket_name,
@@ -233,7 +229,7 @@ fn process_exam(
                 }
             };
             let tcircles = template_circle_map.get(&(page_num as u32));
-            if (tcircles.is_some()) {
+            if tcircles.is_some() {
                 draw_circles_blue(&mut template_imgd, &tcircles.unwrap(), 2);
             }
             let file_stem = pdf_template_path

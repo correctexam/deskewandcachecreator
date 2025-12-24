@@ -1,8 +1,8 @@
 use akaze::Akaze;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, RgbImage};
 use nalgebra::{Matrix3, Vector2, Vector3, Matrix4, Vector4};
-use rand::seq::{IndexedRandom, SliceRandom};
-use rand::thread_rng;
+use rand::seq::{IndexedRandom};
+use rand::rng;
 use rayon::iter::{ParallelBridge, ParallelIterator};
 // =======================================================================
 // CONFIGURATION
@@ -17,24 +17,6 @@ type Point2 = Vector2<f64>;
 struct Match {
     src: Point2, // Point Global Scan
     dst: Point2, // Point Global Ref
-}
-
-fn main() {
-    // Remplacer par vos images réelles
-    // let img_ref = image::open("ref.jpg").unwrap();
-    // let img_scan = image::open("scan.jpg").unwrap();
-    
-    // Simulation pour l'exemple
-    let img_ref = DynamicImage::ImageRgb8(ImageBuffer::new(2000, 3000));
-    let img_scan = DynamicImage::ImageRgb8(ImageBuffer::new(2100, 3100)); // Scan légèrement plus grand/décalé
-
-    match deskew_constrained(&img_ref, &img_scan) {
-        Ok(res) => {
-            res.save("deskewed_similarity.jpg").unwrap();
-            println!("Terminé ! Image sauvegardée.");
-        }
-        Err(e) => eprintln!("Erreur: {}", e),
-    }
 }
 
 /// Fonction principale
@@ -73,7 +55,7 @@ pub fn deskew_constrained(img_ref: &DynamicImage, img_scan: &DynamicImage) -> Re
 
 fn compute_roi_matches(img_ref: &DynamicImage, img_scan: &DynamicImage) -> Result<Vec<Match>, String> {
     let mut fused_matches = Vec::new();
-    let akaze = Akaze::default();
+//    let _ = Akaze::default();
 
     // Définition des offsets pour les 4 coins
     // (TopLeft, TopRight, BottomRight, BottomLeft)
@@ -188,7 +170,7 @@ fn solve_similarity_2_points(m1: &Match, m2: &Match) -> Option<Matrix3<f64>> {
 fn compute_similarity_ransac(matches: &[Match], iter: usize, thresh: f64) -> Option<Matrix3<f64>> {
     let mut best_h = Matrix3::identity();
     let mut max_inliers = 0;
-    let mut rng = thread_rng();
+    let mut rng = rng();
 
     if matches.len() < 2 { return None; }
 
