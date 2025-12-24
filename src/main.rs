@@ -15,7 +15,7 @@ use crate::akazeai::akazeai::deskew_constrained;
 use crate::s3fs::s3fs::{get_object, put_object};
 use crate::sqliteutils::sqliteutils::*;
 use crate::square::square::*;
-use crate::utils::utils::save_as_webp;
+use crate::utils::utils::{parse_page_selection, save_as_webp};
 // Définition de la structure pour les arguments de ligne de commande
 /* #[derive(clap::Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -83,10 +83,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let pages_to_manage: Vec<u32> = if args.pages_to_manage.trim() == "all" {
         vec![]
     } else {
-        args.pages_to_manage
-            .split(',')
-            .filter_map(|s| s.trim().parse::<u32>().ok())
-            .collect()
+       match parse_page_selection(&args.pages_to_manage)  {
+            Ok(pages) => pages,
+            Err(_) => vec![]            
+        }
     };
 
     let _ = process_exam(
