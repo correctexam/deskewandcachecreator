@@ -21,6 +21,11 @@ nalgebra = "0.34.1"
 #akaze = "0.7"       # Implémentation pure Rust de AKAZE
 
 rayon = "1.11.0"
+rusqlite = { version = "0.38.0", features = ["bundled","blob"] }
+base64  = "0.22.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [dependencies.akaze]
 path = "./akaze"
+

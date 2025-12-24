@@ -7,8 +7,10 @@ mod akazeai;
 mod akazeopenai;
 mod square;
 mod utils;
+mod sqliteutils;
 use crate::akazeai::akazeai::deskew_constrained;
 use crate::square::square::*;
+use crate::sqliteutils::{sqliteutils::*};
 use crate::utils::utils::{save_as_webp};
 // Définition de la structure pour les arguments de ligne de commande
 #[derive(clap::Parser, Debug)]
@@ -28,7 +30,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = <Args as clap::Parser>::parse();
 
     // Traitement des deux fichiers PDF
-    let circles = process_pdf(&args.pdf_path_1, None, -1, None);
+    let circles = process_pdf(&args.pdf_path_1, None, -1, None,1);
     if circles.is_err() {
         println!("\n❌ Erreur lors du traitement du premier fichier !");
         return Err(circles.err().unwrap());
@@ -37,8 +39,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         process_pdf(
             &args.pdf_path_2,
             Some(templatecircle),
-            -1,
+            270,
             Some(&args.pdf_path_1),
+            1
             //            None
         )?;
 
@@ -60,9 +63,10 @@ fn process_pdf(
     template_circle: Option<CircleMap>,
     page_to_manage: i32,
     template_path: Option<&Path>,
+    exam_id: i32,
 ) -> Result<CircleMap, Box<dyn Error>> {
     println!("\n--- Traitement du fichier : {} ---", pdf_path.display());
-
+    let conn = create_connection(exam_id)?;
     let mut circles_map: CircleMap = HashMap::new();
     let mut template_image_map: TemplateImageMap = HashMap::new();
 
@@ -191,6 +195,13 @@ fn process_pdf(
                 match deskew_constrained(&template_img,&img) {
                     Ok(res) => {
                         save_as_webp(&res, &output_align_path).unwrap();
+                                        let _=save_image_to_db_webp(
+                            &conn,
+                            &res,
+                            &(page_num as i32),
+                            ImageState::Align,
+                        );
+
                         println!(
                             "    -> Sauvegardé (aligné avec n points) : {}",
                             output_align_path.display()
@@ -207,6 +218,12 @@ fn process_pdf(
                 draw_circles_blue(&mut img, &circles, 2);
 
                 let _ = save_as_webp(&img, output_path.as_path());
+                let _=save_image_to_db_webp(
+                            &conn,
+                            &img,
+                            &(page_num as i32),
+                            ImageState::NonAlign,
+                        );
                 println!("    -> Sauvegardé : {}", output_path.display());
 
                 if template_circle.is_some() {
@@ -257,6 +274,13 @@ fn process_pdf(
                             apply_similarity(&img, &transform, img.width(), img.height());
                         let dynoutput = DynamicImage::ImageRgba8(aligned_image);
                         save_as_webp(&dynoutput, &output_align_path).unwrap();
+                        let _=save_image_to_db_webp(
+                            &conn,
+                            &dynoutput,
+                            &(page_num as i32),
+                            ImageState::Align,
+                        );
+
                         println!(
                             "    -> Sauvegardé (aligné avec 3 points) : {}",
                             output_align_path.display()
@@ -267,6 +291,12 @@ fn process_pdf(
                             apply_similarity(&img, &transform, img.width(), img.height());
                         let dynoutput = DynamicImage::ImageRgba8(aligned_image);
                         save_as_webp(&dynoutput, &output_align_path).unwrap();
+                        let _=save_image_to_db_webp(
+                            &conn,
+                            &dynoutput,
+                            &(page_num as i32),
+                            ImageState::Align,
+                        );
                         println!(
                             "    -> Sauvegardé (aligné avec 4 points) : {}",
                             output_align_path.display()
@@ -280,6 +310,6 @@ fn process_pdf(
     }
 
     drop(document); // Demonstrate that the page can be used after the document is dropped.
-
+    close_connection(conn);
     Ok(circles_map)
 }
