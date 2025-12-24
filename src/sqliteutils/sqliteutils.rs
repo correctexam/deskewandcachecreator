@@ -26,20 +26,10 @@ pub struct Document {
     pub pages: String,
 }
 
-// --- Structure StoredImage (identique) ---
-#[derive(Debug)]
-pub struct StoredImage {
-    pub page: i32,
-    pub width: u32,
-    pub height: u32,
-    pub data: Vec<u8>, // Le BLOB brut (bytes du WebP)
-                       // Vous pourriez ajouter un champ 'format: String' si vous stockez plusieurs formats
-}
-
 const WEBP_DATA_PREFIX: &str = "data:image/webp;base64,";
 
 /// Crée la table (structure identique)
-pub fn create_connection(exam_id: i32) -> Result<Connection, rusqlite::Error> {
+pub fn create_connection(exam_id: u32) -> Result<Connection, rusqlite::Error> {
     let str = format!("scans_webp_{}.db", exam_id);
     let conn = Connection::open(str)?;
     create_table(&conn, exam_id)?;
@@ -48,12 +38,12 @@ pub fn create_connection(exam_id: i32) -> Result<Connection, rusqlite::Error> {
 
 /// Crée la table (structure identique)
 pub fn close_connection(conn: Connection) -> Result<(), rusqlite::Error> {
-    conn.close();
+    let _ = conn.close();
     Ok(())
 }
 
 /// Crée la table (structure identique)
-fn create_table(conn: &Connection, exam_id: i32) -> Result<(), rusqlite::Error> {
+fn create_table(conn: &Connection, exam_id: u32) -> Result<(), rusqlite::Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS template (
             page INTEGER NOT NULL PRIMARY KEY,
