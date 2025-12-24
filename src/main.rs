@@ -8,10 +8,10 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 mod akazeai;
 mod akazeopenai;
+mod s3fs;
 mod sqliteutils;
 mod square;
 mod utils;
-mod s3fs;
 use crate::akazeai::akazeai::deskew_constrained;
 use crate::s3fs::s3fs::{get_object, put_object};
 use crate::sqliteutils::sqliteutils::*;
@@ -52,14 +52,23 @@ struct Args {
     algo: u8, // 0=NoAlign,1=CircleAlign,2=Akaze
 
     /// Debug
-    #[arg(long, short, action)]
+    #[arg(long, short, action, default_value_t = false)]
     debug: bool, //allow debug
+
+    #[arg(long, short,default_value = "http://localhost:9000")]
+    server_url: String,
+    #[arg(long, short,default_value = "test")]
+    bucket_name: String,
+    #[arg(long, short,default_value = "admin")]
+    login: String,
+    #[arg(long, short,default_value = "minioadmin")]
+    pass: String,
 }
 
 pub type CircleMap = HashMap<u32, Vec<Option<Circle>>>;
 pub type TemplateImageMap = HashMap<u32, DynamicImage>;
 
- fn  main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let args = <Args as clap::Parser>::parse();
     if args.algo > 2 {
         println!("\n❌ Algo d'alignement invalide !");
@@ -88,6 +97,10 @@ pub type TemplateImageMap = HashMap<u32, DynamicImage>;
         args.scan_id as u32,
         align_algo,
         args.debug,
+        args.server_url.as_str(),
+        args.bucket_name.as_str(),
+        args.login.as_str(),
+        args.pass.as_str(),
     );
     Ok(())
 }
@@ -99,8 +112,6 @@ fn page_mod(n: usize, m: usize) -> Option<usize> {
     }
 }
 
-
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AlignAlgo {
     NoAlign,     // Pas d'alignement
@@ -109,15 +120,30 @@ pub enum AlignAlgo {
 }
 
 /// Fonction principale pour traiter un seul fichier PDF
- fn process_exam(
+fn process_exam(
     pages_to_manage: Vec<u32>,
     exam_id: u32,
     template_id: u32,
     scan_id: u32,
     align_algo: AlignAlgo,
     debug: bool,
+    server_url: &str,
+    bucket_name: &str,
+    login: &str,
+    pass: &str,
 ) -> Result<(), Box<dyn Error>> {
     println!("\n--- Traitement de l'exam : {} ---", exam_id);
+    if pages_to_manage.len() > 0 {
+        let existingcache = get_object(
+            server_url,
+            bucket_name,
+            &format!("cache/{}.sqlite3", exam_id),
+            login,
+            pass,
+        )?;
+        fs::write(format!("{}.sqlite3", exam_id), existingcache.bytes())?;
+    }
+
     let conn = create_connection(exam_id)?;
     //        pdf_path: &Path,
     let mut template_circle_map: CircleMap = HashMap::new();
@@ -129,33 +155,30 @@ pub enum AlignAlgo {
     let pdf_template_path = Path::new(&templatepath);
     let pdf_scan_path = Path::new(scanpath);
     let template = get_object(
-        "http://localhost:9000",
-        "test",
+        server_url,
+        bucket_name,
         &format!("template/{}.pdf", template_id),
-        "admin",
-        "minioadmin",
+        login,
+        pass,
     )?;
     let templatedata = template.bytes().to_vec();
-        let cursor = Cursor::new(templatedata);
-    let document_template =    PdfiumDocument::new_from_reader(cursor, None).unwrap();
-//    let document_template = PdfiumDocument::new_from_reader(pdf_template_path, None).unwrap();
-
-
+    let cursor = Cursor::new(templatedata);
+    let document_template = PdfiumDocument::new_from_reader(cursor, None).unwrap();
+    //    let document_template = PdfiumDocument::new_from_reader(pdf_template_path, None).unwrap();
 
     // let document_template = PdfiumDocument::new_from_path(pdf_template_path, None).unwrap();
     let scan = get_object(
-        "http://localhost:9000",
-        "test",
+        server_url,
+        bucket_name,
         &format!("scan/{}.pdf", scan_id),
-        "admin",
-        "minioadmin",
+        login,
+        pass,
     )?;
     let scan_data = scan.bytes().to_vec();
     let cursorscan = Cursor::new(scan_data);
-    let document_scan =   PdfiumDocument::new_from_reader(cursorscan, None).unwrap();
+    let document_scan = PdfiumDocument::new_from_reader(cursorscan, None).unwrap();
 
-
-//    let document_scan = PdfiumDocument::new_from_path(pdf_scan_path, None).unwrap();
+    //    let document_scan = PdfiumDocument::new_from_path(pdf_scan_path, None).unwrap();
     let config = PdfiumRenderConfig::new().with_height(2000);
 
     // 2. Charger le document PDF
@@ -429,7 +452,7 @@ pub enum AlignAlgo {
                         ImageState::Align,
                     );
                     println!("    -> Sauvegardé (aligné avec 4 points) : {}", page_num);
-                                        if debug {
+                    if debug {
                         let file_stem = pdf_scan_path
                             .file_stem()
                             .and_then(|s| s.to_str())
@@ -445,45 +468,43 @@ pub enum AlignAlgo {
                         let output_aligned_path = output_dir.join(output_aligned_filename);
                         let _ = save_as_webp(&dynoutput, output_aligned_path.as_path());
                     }
-
-
                 }
             } else {
                 let _ = save_image_to_db_webp(&conn, &img, &(page_num as i32), ImageState::Align);
-                    if debug {
-                        let file_stem = pdf_scan_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .ok_or("Le chemin du fichier n'a pas de nom de base valide (stem).")?;
+                if debug {
+                    let file_stem = pdf_scan_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .ok_or("Le chemin du fichier n'a pas de nom de base valide (stem).")?;
 
-                        let output_dir = pdf_scan_path
-                            .parent()
-                            .unwrap_or_else(|| Path::new("."))
-                            .join(format!("{}_webp_images", file_stem));
-                        std::fs::create_dir_all(&output_dir)?;
-                        let output_aligned_filename =
-                            format!("{}_page_aligned_{}.webp", file_stem, page_num);
-                        let output_aligned_path = output_dir.join(output_aligned_filename);
-                        let _ = save_as_webp(&img, output_aligned_path.as_path());
-                    }
+                    let output_dir = pdf_scan_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(format!("{}_webp_images", file_stem));
+                    std::fs::create_dir_all(&output_dir)?;
+                    let output_aligned_filename =
+                        format!("{}_page_aligned_{}.webp", file_stem, page_num);
+                    let output_aligned_path = output_dir.join(output_aligned_filename);
+                    let _ = save_as_webp(&img, output_aligned_path.as_path());
+                }
             }
         }
     }
 
     drop(document_scan); // Demonstrate that the page can be used after the document is dropped.
     drop(document_template); // Demonstrate that the page can be used after the document is dropped.
-    let _ =close_connection(conn);
-     let content = fs::read(format!("{}.sqlite3",exam_id))?;
+    let _ = close_connection(conn);
+    let content = fs::read(format!("{}.sqlite3", exam_id))?;
 
-    let _ =put_object(
-                "http://localhost:9000",
-        "test",
+    let _ = put_object(
+        server_url,
+        bucket_name,
         content.as_slice(),
         &format!("cache/{}.sqlite3", exam_id),
-        "admin",
-        "minioadmin",
+        login,
+        pass,
     );
-    fs::remove_file(format!("{}.sqlite3",exam_id))?;
+    fs::remove_file(format!("{}.sqlite3", exam_id))?;
 
     Ok(())
 }
