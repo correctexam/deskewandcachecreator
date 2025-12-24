@@ -3,13 +3,17 @@ use pdfium::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
+use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 mod akazeai;
 mod akazeopenai;
 mod sqliteutils;
 mod square;
 mod utils;
+mod s3fs;
 use crate::akazeai::akazeai::deskew_constrained;
+use crate::s3fs::s3fs::{get_object, put_object};
 use crate::sqliteutils::sqliteutils::*;
 use crate::square::square::*;
 use crate::utils::utils::save_as_webp;
@@ -55,7 +59,7 @@ struct Args {
 pub type CircleMap = HashMap<u32, Vec<Option<Circle>>>;
 pub type TemplateImageMap = HashMap<u32, DynamicImage>;
 
-fn main() -> Result<(), Box<dyn Error>> {
+ fn  main() -> Result<(), Box<dyn Error>> {
     let args = <Args as clap::Parser>::parse();
     if args.algo > 2 {
         println!("\n❌ Algo d'alignement invalide !");
@@ -68,7 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         2 => AlignAlgo::Akaze,
         _ => AlignAlgo::NoAlign,
     };
-    let pages_to_manage: Vec<u32> = if args.pages_to_manage.trim().is_empty() {
+    let pages_to_manage: Vec<u32> = if args.pages_to_manage.trim() == "all" {
         vec![]
     } else {
         args.pages_to_manage
@@ -77,14 +81,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             .collect()
     };
 
-    let _ = process_exam(
+    let t = process_exam(
         pages_to_manage,
         args.exam_id as u32,
         args.template_id as u32,
         args.scan_id as u32,
         align_algo,
         args.debug,
-    )?;
+    );
     Ok(())
 }
 fn page_mod(n: usize, m: usize) -> Option<usize> {
@@ -95,224 +99,7 @@ fn page_mod(n: usize, m: usize) -> Option<usize> {
     }
 }
 
-/// Fonction principale pour traiter un seul fichier PDF
-/* fn process_pdf(
-    pdf_path: &Path,
-    template_circle: Option<CircleMap>,
-    page_to_manage: i32,
-    template_path: Option<&Path>,
-    exam_id: u32,
-) -> Result<CircleMap, Box<dyn Error>> {
-    println!("\n--- Traitement du fichier : {} ---", pdf_path.display());
-    let conn = create_connection(exam_id)?;
-    let mut circles_map: CircleMap = HashMap::new();
-    let mut template_image_map: TemplateImageMap = HashMap::new();
 
-    // 1. Définir les chemins de sortie et le nom de base
-    let file_stem = pdf_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("Le chemin du fichier n'a pas de nom de base valide (stem).")?;
-
-    let output_dir = pdf_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("{}_webp_images", file_stem));
-    std::fs::create_dir_all(&output_dir)?;
-
-    // Créer le répertoire de sortie s'il n'existe pas
-    //    std_extra::fs::create_dir_if_not_exists(&output_dir)?;
-    println!("Dossier de sortie créé : {}", output_dir.display());
-
-    let document = PdfiumDocument::new_from_path(pdf_path, None).unwrap();
-    // let page = document.page(0).unwrap();
-    let config = PdfiumRenderConfig::new().with_height(2000);
-    // 2. Charger le document PDF
-    //    let document = pdfium.load_pdf_from_file(pdf_path, None)?;
-    let page_count = document.pages().page_count();
-    println!("{} pages trouvées.", page_count);
-
-    if template_path.is_some() {
-        let template_document =
-            PdfiumDocument::new_from_path(template_path.unwrap(), None).unwrap();
-        // 2. Charger le document PDF
-
-        //            let page_count = document.pages().page_count();
-        //            println!("{} pages trouvées.", page_count);
-        for (index_template, template_page) in template_document.pages().enumerate() {
-            let page_num = index_template + 1;
-            let bitmap_template = template_page.unwrap().render(&config).unwrap();
-            let template_img = match bitmap_template.as_rgb8_image() {
-                Ok(template_img) => template_img,
-                Err(_) => {
-                    println!(
-                        "    ! Avertissement : Impossible de convertir la page {} en image RGB8.",
-                        page_num
-                    );
-                    continue;
-                }
-            };
-            template_image_map.insert(index_template as u32 + 1, template_img);
-        }
-    }
-
-    // 4. Parcourir et traiter chaque page
-    for (index, page) in document.pages().enumerate() {
-        let page_num = index + 1;
-
-        if (page_to_manage == (-1 as i32)) || ((page_num as i32) == page_to_manage) {
-            let output_filename = format!("{}_page_{}.webp", file_stem, page_num);
-            let output_path = output_dir.join(output_filename);
-            let output_align_filename = format!("{}_align_page_{}.webp", file_stem, page_num);
-            let output_align_path = output_dir.join(output_align_filename);
-
-            println!(
-                "  - Rendu et conversion de la page {}/{}...",
-                page_num, page_count
-            );
-
-            let bitmap = page.unwrap().render(&config).unwrap();
-
-            // --- Remplacement ici : obtenir l'image en owned DynamicImage (mutable)
-            let mut img = match bitmap.as_rgb8_image() {
-                Ok(img) => img,
-                Err(_) => {
-                    println!(
-                        "    ! Avertissement : Impossible de convertir la page {} en image RGB8.",
-                        page_num
-                    );
-                    continue;
-                }
-            };
-
-            //let circles = detect_black_circles_from_image(&mut img, 100);
-            let gray = img.to_luma8();
-
-            if template_image_map.len() > 0 {
-                let pagemod = &(page_mod(page_num, template_image_map.len()).unwrap() as u32);
-                let _ = save_as_webp(&img, output_path.as_path());
-                println!("    -> Sauvegardé : {}", output_path.display());
-
-                let template_img = template_image_map.get(pagemod).unwrap();
-
-
-                match deskew_constrained(&template_img, &img) {
-                    Ok(res) => {
-                        save_as_webp(&res, &output_align_path).unwrap();
-                        let _ = save_image_to_db_webp(
-                            &conn,
-                            &res,
-                            &(page_num as i32),
-                            ImageState::Align,
-                        );
-
-                        println!(
-                            "    -> Sauvegardé (aligné avec n points) : {}",
-                            output_align_path.display()
-                        );
-                        println!("Terminé ! Image sauvegardée.");
-                    }
-                    Err(e) => eprintln!("Erreur: {}", e),
-                }
-
-                println!("    -> Sauvegardé : {}", output_align_path.display());
-            } else {
-                let circles = detect_circles_in_four_corners_advanced(&gray, 300);
-                // Dessin des cercles en bleu
-                draw_circles_blue(&mut img, &circles, 2);
-
-                let _ = save_as_webp(&img, output_path.as_path());
-                let _ =
-                    save_image_to_db_webp(&conn, &img, &(page_num as i32), ImageState::NonAlign);
-                println!("    -> Sauvegardé : {}", output_path.display());
-
-                if template_circle.is_some() {
-                    let template_circle_unwrap = template_circle.as_ref().unwrap();
-                    let mut src_points = [Point { x: 0.0, y: 0.0 }; 4];
-                    let mut dst_points = [Point { x: 0.0, y: 0.0 }; 4];
-                    let mut missing_round = 0;
-                    let mut missing_round_index = 0;
-
-                    for (i, c) in circles.iter().enumerate() {
-                        let pagemod =
-                            &(page_mod(page_num, template_circle_unwrap.len()).unwrap() as u32);
-                        if c.is_none() {
-                            missing_round = missing_round + 1;
-                            missing_round_index = i;
-                        } else if c.is_some() && template_circle_unwrap.get(pagemod).is_some() {
-                            let template_circles = template_circle_unwrap.get(pagemod).unwrap();
-                            if template_circles[i].is_some() {
-                                let tc = template_circles[i].as_ref().unwrap();
-                                let c_unwrap = c.as_ref().unwrap();
-                                src_points[i] = Point {
-                                    x: c_unwrap.cx,
-                                    y: c_unwrap.cy,
-                                };
-                                dst_points[i] = Point { x: tc.cx, y: tc.cy };
-                            }
-                        }
-                    }
-                    if missing_round > 1 {
-                        println!(
-                            "    ! Avertissement : Impossible d'aligner la page {}",
-                            page_num
-                        );
-                    } else if missing_round == 1 {
-                        // Utilisation de 3 points pour l'estimation
-                        let mut src_points_3 = [Point { x: 0.0, y: 0.0 }; 3];
-                        let mut dst_points_3 = [Point { x: 0.0, y: 0.0 }; 3];
-                        let mut idx = 0;
-                        for i in 0..4 {
-                            if i != missing_round_index {
-                                src_points_3[idx] = src_points[i];
-                                dst_points_3[idx] = dst_points[i];
-                                idx += 1;
-                            }
-                        }
-                        let transform = estimate_similarity_3pts(&src_points_3, &dst_points_3);
-                        let aligned_image =
-                            apply_similarity(&img, &transform, img.width(), img.height());
-                        let dynoutput = DynamicImage::ImageRgba8(aligned_image);
-                        save_as_webp(&dynoutput, &output_align_path).unwrap();
-                        let _ = save_image_to_db_webp(
-                            &conn,
-                            &dynoutput,
-                            &(page_num as i32),
-                            ImageState::Align,
-                        );
-
-                        println!(
-                            "    -> Sauvegardé (aligné avec 3 points) : {}",
-                            output_align_path.display()
-                        );
-                    } else {
-                        let transform = estimate_similarity(&src_points, &dst_points);
-                        let aligned_image =
-                            apply_similarity(&img, &transform, img.width(), img.height());
-                        let dynoutput = DynamicImage::ImageRgba8(aligned_image);
-                        save_as_webp(&dynoutput, &output_align_path).unwrap();
-                        let _ = save_image_to_db_webp(
-                            &conn,
-                            &dynoutput,
-                            &(page_num as i32),
-                            ImageState::Align,
-                        );
-                        println!(
-                            "    -> Sauvegardé (aligné avec 4 points) : {}",
-                            output_align_path.display()
-                        );
-                    }
-                } else {
-                    circles_map.insert(page_num as u32, circles);
-                }
-            }
-        }
-    }
-
-    drop(document); // Demonstrate that the page can be used after the document is dropped.
-    close_connection(conn);
-    Ok(circles_map)
-} */
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AlignAlgo {
@@ -322,7 +109,7 @@ pub enum AlignAlgo {
 }
 
 /// Fonction principale pour traiter un seul fichier PDF
-fn process_exam(
+ fn process_exam(
     pages_to_manage: Vec<u32>,
     exam_id: u32,
     template_id: u32,
@@ -341,15 +128,41 @@ fn process_exam(
     let scanpath = &format!("scan-{}.pdf", scan_id);
     let pdf_template_path = Path::new(&templatepath);
     let pdf_scan_path = Path::new(scanpath);
-    let document_template = PdfiumDocument::new_from_path(pdf_template_path, None).unwrap();
-    let document_scan = PdfiumDocument::new_from_path(pdf_scan_path, None).unwrap();
+    let template = get_object(
+        "http://localhost:9000",
+        "test",
+        &format!("template/{}.pdf", template_id),
+        "admin",
+        "minioadmin",
+    )?;
+    let templatedata = template.bytes().to_vec();
+        let cursor = Cursor::new(templatedata);
+    let document_template =    PdfiumDocument::new_from_reader(cursor, None).unwrap();
+//    let document_template = PdfiumDocument::new_from_reader(pdf_template_path, None).unwrap();
+
+
+
+    // let document_template = PdfiumDocument::new_from_path(pdf_template_path, None).unwrap();
+    let scan = get_object(
+        "http://localhost:9000",
+        "test",
+        &format!("scan/{}.pdf", scan_id),
+        "admin",
+        "minioadmin",
+    )?;
+    let scan_data = scan.bytes().to_vec();
+    let cursorscan = Cursor::new(scan_data);
+    let document_scan =   PdfiumDocument::new_from_reader(cursorscan, None).unwrap();
+
+
+//    let document_scan = PdfiumDocument::new_from_path(pdf_scan_path, None).unwrap();
     let config = PdfiumRenderConfig::new().with_height(2000);
 
     // 2. Charger le document PDF
     //    let document = pdfium.load_pdf_from_file(pdf_path, None)?;
     let page_count_template = document_template.pages().page_count();
     println!("{} pages template trouvées.", page_count_template);
-    let page_count_scan = document_template.pages().page_count();
+    let page_count_scan = document_scan.pages().page_count();
     println!("{} pages scan trouvées.", page_count_scan);
 
     for (index_template, template_page) in document_template.pages().enumerate() {
@@ -423,7 +236,7 @@ fn process_exam(
         if pages_to_manage.len() == 0 || pages_to_manage.contains(&(page_num as u32)) {
             println!(
                 "  - Rendu et conversion de la page {}/{}...",
-                page_num, page_count_template
+                page_num, page_count_scan
             );
             let bitmap = page.unwrap().render(&config).unwrap();
             // --- Remplacement ici : obtenir l'image en owned DynamicImage (mutable)
@@ -659,6 +472,18 @@ fn process_exam(
 
     drop(document_scan); // Demonstrate that the page can be used after the document is dropped.
     drop(document_template); // Demonstrate that the page can be used after the document is dropped.
-    close_connection(conn);
+    let _ =close_connection(conn);
+     let content = fs::read(format!("{}.sqlite3",exam_id))?;
+
+    let _ =put_object(
+                "http://localhost:9000",
+        "test",
+        content.as_slice(),
+        &format!("cache/{}.sqlite3", exam_id),
+        "admin",
+        "minioadmin",
+    );
+    fs::remove_file(format!("{}.sqlite3",exam_id))?;
+
     Ok(())
 }

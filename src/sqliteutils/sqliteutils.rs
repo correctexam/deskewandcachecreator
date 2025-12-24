@@ -30,7 +30,7 @@ const WEBP_DATA_PREFIX: &str = "data:image/webp;base64,";
 
 /// Crée la table (structure identique)
 pub fn create_connection(exam_id: u32) -> Result<Connection, rusqlite::Error> {
-    let str = format!("scans_webp_{}.db", exam_id);
+    let str = format!("{}.sqlite3", exam_id);
     let conn = Connection::open(str)?;
     create_table(&conn, exam_id)?;
     Ok(conn)
