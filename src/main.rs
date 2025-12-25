@@ -284,7 +284,7 @@ pub enum AlignAlgo {
             &format!("cache/{}.sqlite3", exam_id),
             login,
             pass,
-        )?;
+        ).await?;
         fs::write(format!("{}.sqlite3", exam_id), existingcache.bytes())?;
     }
 
@@ -304,7 +304,7 @@ pub enum AlignAlgo {
         &format!("template/{}.pdf", template_id),
         login,
         pass,
-    )?;
+    ).await?;
     let templatedata = template.bytes().to_vec();
     let cursor = Cursor::new(templatedata);
     let document_template = PdfiumDocument::new_from_reader(cursor, None).unwrap();
@@ -314,7 +314,7 @@ pub enum AlignAlgo {
         &format!("scan/{}.pdf", scan_id),
         login,
         pass,
-    )?;
+    ).await?;
     let scan_data = scan.bytes().to_vec();
     let cursorscan = Cursor::new(scan_data);
     let document_scan = PdfiumDocument::new_from_reader(cursorscan, None).unwrap();

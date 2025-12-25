@@ -3,7 +3,7 @@ use s3::error::S3Error;
 use s3::request::ResponseData;
 use s3::{Bucket, BucketConfiguration, Region};
 
-pub fn get_object(
+pub async fn get_object(
     server_url: &str,
     bucket_name: &str,
     s3_path: &str,
@@ -22,23 +22,23 @@ pub fn get_object(
     let mut bucket =
         Bucket::new(bucket_name, region.clone(), credentials.clone())?.with_path_style();
 
-    if !(bucket.exists_blocking()?) {
-        bucket = Bucket::create_with_path_style_blocking(
+    if !(bucket.exists().await?) {
+        bucket = Bucket::create_with_path_style(
             bucket_name,
             region,
             credentials,
             BucketConfiguration::default(),
-        )?
+        ).await?
         .bucket;
     }
 
-    let response_data: s3::request::ResponseData = bucket.get_object_blocking(s3_path)?;
+    let response_data: s3::request::ResponseData = bucket.get_object(s3_path).await?;
     assert_eq!(response_data.status_code(), 200);
     Ok(response_data)
 }
 
 
-pub fn put_object(
+pub async  fn put_object(
     server_url: &str,
     bucket_name: &str,
     content: &[u8],
@@ -58,17 +58,17 @@ pub fn put_object(
     let mut bucket =
         Bucket::new(bucket_name, region.clone(), credentials.clone())?.with_path_style();
 
-    if !(bucket.exists_blocking()?) {
-        bucket = Bucket::create_with_path_style_blocking(
+    if !(bucket.exists().await?) {
+        bucket = Bucket::create_with_path_style(
             bucket_name,
             region,
             credentials,
             BucketConfiguration::default(),
-        )?
+        ).await?
         .bucket;
     }
 
-    let response_data: s3::request::ResponseData = bucket.put_object_blocking(s3_path,content)?;
+    let response_data: s3::request::ResponseData = bucket.put_object(s3_path,content).await?;
     assert_eq!(response_data.status_code(), 200);
     Ok(response_data)
 }
