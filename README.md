@@ -27,3 +27,8 @@ TODO
 ## 📝 Licence
 
 Ce projet est fourni à titre d'exemple éducatif et technique. Libre à vous de l'utiliser et de le modifier.
+
+
+```bash
+amqp-publish --url="amqp://rabbitmq:rabbitmq@localhost:5672"     --routing-key="scan_jobs_queue"     --body='{"pages_to_manage": "1-3", "exam_id": 855, "template_id": 857, "scan_id": 607, "algo": 2}'
+```

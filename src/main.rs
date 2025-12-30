@@ -1,16 +1,22 @@
+use futures_lite::stream::StreamExt;
 use image::DynamicImage;
+use lapin::{
+    BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
+    auth::Credentials,
+    options::{
+        BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, ExchangeDeclareOptions,
+        QueueDeclareOptions,
+    },
+    types::FieldTable,
+};
 use pdfium::*;
 use serde::{Deserialize, Serialize};
-use urlencoding::encode;
-use std::{collections::HashMap};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
-use futures_lite::stream::StreamExt;
-use lapin::{
-    BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind, auth::Credentials, options::{BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, ExchangeDeclareOptions, QueueDeclareOptions}, types::FieldTable
-};
+use urlencoding::encode;
 mod akazeai;
 mod s3fs;
 mod sqliteutils;
@@ -55,6 +61,13 @@ struct Args {
     #[arg(short, long, default_value_t = 1)]
     algo: u8, // 0=NoAlign,1=CircleAlign,2=Akaze
 
+    #[arg(short, long, default_value_t = 2000)]
+    heightresolution: i32,
+    #[arg(short, long, default_value_t = 300)]
+    corner_square_size: u32,
+    #[arg(short, long, default_value_t = 10.0)]
+    min_radius: f32,
+
     /// Debug
     #[arg(long, short, action, default_value_t = false)]
     debug: bool, //allow debug
@@ -67,7 +80,6 @@ struct Args {
 
     #[arg(long, short, default_value = "5672")]
     mq_server_port: u32,
-
 
     #[arg(long, short, default_value = "rabbitmq")]
     mq_server_login: String,
@@ -83,9 +95,9 @@ struct Args {
     #[arg(long, short, default_value = "test")]
     bucket_name: String,
     #[arg(long, short, default_value = "admin")]
-    login: String,
+    minio_login: String,
     #[arg(long, short, default_value = "minioadmin")]
-    pass: String,
+    minio_pass: String,
 }
 
 // 1. Le message reçu (Ordre de travail)
@@ -100,6 +112,12 @@ struct ScanRequest {
     scan_id: u32,
     #[serde(default = "default_algo")]
     algo: u8,
+    #[serde(default = "default_heightresolution")]
+    heightresolution: i32,
+    #[serde(default = "default_corner_square_size")]
+    corner_square_size: u32,
+    #[serde(default = "default_min_radius")]
+    min_radius: f32,
 }
 
 fn default_u32_one() -> u32 {
@@ -109,10 +127,20 @@ fn default_algo() -> u8 {
     1
 }
 
+fn default_heightresolution() -> i32 {
+    2000
+}
+fn default_corner_square_size() -> u32 {
+    300
+}
+fn default_min_radius() -> f32 {
+    10.0
+}
+
 // 2. Le message envoyé (État d'avancement)
 #[derive(Debug, Serialize)]
 struct ScanStatus {
-    scan_id: u32,
+    exam_id: u32,
     page: u32,
     status: String, // "processing", "success", "error"
     progress: u32,  // Pourcentage global
@@ -151,9 +179,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         let connectionp: ConnectionProperties = ConnectionProperties::default();
         let encoded_pass = encode(&args.mq_server_pass);
-        let addr = format!("amqp://{}:{}@{}:{}/%2f", args.mq_server_login, &encoded_pass, args.mq_server_host, args.mq_server_port);
+        let addr = format!(
+            "amqp://{}:{}@{}:{}/%2f",
+            args.mq_server_login, &encoded_pass, args.mq_server_host, args.mq_server_port
+        );
 
-//        connectionp.set_credentials(credentials);
+        //        connectionp.set_credentials(credentials);
         let conn = Connection::connect(&addr, connectionp).await?;
         let channel = conn.create_channel().await?;
 
@@ -204,15 +235,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             if let Ok(delivery) = delivery {
                 println!("📥 Message reçu !");
                 // Traitement (Payload -> JSON -> Logique)
-                match process_message(&channel, &delivery.data,
-                            args.debug,
-            args.server_url.as_str(),
-            args.bucket_name.as_str(),
-            args.login.as_str(),
-            args.pass.as_str(),
-            &args.mq_server_ouputqueue,
-
-                 ).await {
+                match process_message(
+                    &channel,
+                    &delivery.data,
+                    args.debug,
+                    args.server_url.as_str(),
+                    args.bucket_name.as_str(),
+                    args.minio_login.as_str(),
+                    args.minio_login.as_str(),
+                    &args.mq_server_ouputqueue,
+                )
+                .await
+                {
                     Ok(_) => {
                         // Succès : On acquitte le message (ACK)
                         delivery.ack(BasicAckOptions::default()).await?;
@@ -233,15 +267,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
             args.exam_id as u32,
             args.template_id as u32,
             args.scan_id as u32,
+            args.heightresolution,
+            args.corner_square_size,
+            args.min_radius,
             align_algo,
             args.debug,
             args.server_url.as_str(),
             args.bucket_name.as_str(),
-            args.login.as_str(),
-            args.pass.as_str(),
-            None, 
+            &args.minio_login.as_str(),
+            args.minio_pass.as_str(),
+            None,
             &args.mq_server_ouputqueue,
-        ).await?;
+        )
+        .await?;
     }
     Ok(())
 }
@@ -261,20 +299,22 @@ pub enum AlignAlgo {
 }
 
 /// Fonction principale pour traiter un seul fichier PDF
- async fn process_exam(
+async fn process_exam(
     pages_to_manage: Vec<u32>,
     exam_id: u32,
     template_id: u32,
     scan_id: u32,
+    heightresolution: i32,
+    corner_square_size: u32,
+    min_radius: f32,
     align_algo: AlignAlgo,
     debug: bool,
     server_url: &str,
     bucket_name: &str,
     login: &str,
     pass: &str,
-    chan : Option<&Channel>,
-    outputchan : &String,
-
+    chan: Option<&Channel>,
+    outputchan: &String,
 ) -> Result<(), Box<dyn Error>> {
     println!("\n--- Traitement de l'exam : {} ---", exam_id);
     if pages_to_manage.len() > 0 {
@@ -284,7 +324,8 @@ pub enum AlignAlgo {
             &format!("cache/{}.sqlite3", exam_id),
             login,
             pass,
-        ).await?;
+        )
+        .await?;
         fs::write(format!("{}.sqlite3", exam_id), existingcache.bytes())?;
     }
 
@@ -304,7 +345,8 @@ pub enum AlignAlgo {
         &format!("template/{}.pdf", template_id),
         login,
         pass,
-    ).await?;
+    )
+    .await?;
     let templatedata = template.bytes().to_vec();
     let cursor = Cursor::new(templatedata);
     let document_template = PdfiumDocument::new_from_reader(cursor, None).unwrap();
@@ -314,13 +356,14 @@ pub enum AlignAlgo {
         &format!("scan/{}.pdf", scan_id),
         login,
         pass,
-    ).await?;
+    )
+    .await?;
     let scan_data = scan.bytes().to_vec();
     let cursorscan = Cursor::new(scan_data);
     let document_scan = PdfiumDocument::new_from_reader(cursorscan, None).unwrap();
 
     //    let document_scan = PdfiumDocument::new_from_path(pdf_scan_path, None).unwrap();
-    let config = PdfiumRenderConfig::new().with_height(2000);
+    let config = PdfiumRenderConfig::new().with_height(heightresolution);
 
     // 2. Charger le document PDF
     //    let document = pdfium.load_pdf_from_file(pdf_path, None)?;
@@ -358,7 +401,7 @@ pub enum AlignAlgo {
             .to_luma8();
 
         if AlignAlgo::CircleAlign == align_algo {
-            let tcircles = detect_circles_in_four_corners_advanced(&tgray, 300);
+            let tcircles = detect_circles_in_four_corners_advanced(&tgray, corner_square_size,min_radius);
             template_circle_map.insert(page_num as u32, tcircles.clone());
         }
         // Dessin des cercles en bleu
@@ -402,7 +445,7 @@ pub enum AlignAlgo {
                 "  - Rendu et conversion de la page {}/{}...",
                 page_num, page_count_scan
             );
-            
+
             let bitmap = page.unwrap().render(&config).unwrap();
             // --- Remplacement ici : obtenir l'image en owned DynamicImage (mutable)
             let mut img = match bitmap.as_rgb8_image() {
@@ -467,7 +510,7 @@ pub enum AlignAlgo {
                 }
             } else if AlignAlgo::CircleAlign == align_algo {
                 let gray = img.to_luma8();
-                let circles = detect_circles_in_four_corners_advanced(&gray, 300);
+                let circles = detect_circles_in_four_corners_advanced(&gray, corner_square_size,min_radius);
                 // Dessin des cercles en bleu
                 if debug {
                     let file_stem = pdf_template_path
@@ -631,7 +674,6 @@ pub enum AlignAlgo {
                 }
             }
 
-
             if let Some(channel) = chan {
                 realpage = realpage + 1;
                 let mut numberpages = pages_to_manage.len();
@@ -641,20 +683,22 @@ pub enum AlignAlgo {
                 let progress = ((realpage as f32 / numberpages as f32) * 100.0) as u32;
                 let routing_key = format!("scan.status.{}", exam_id);
                 let status_msg = ScanStatus {
-                    scan_id: exam_id,
+                    exam_id: exam_id,
                     page: page_num as u32,
                     status: "running".to_string(),
                     progress: progress,
                     details: format!("Page {} traitée", page_num),
                 };
                 let payload = serde_json::to_vec(&status_msg)?;
-                channel.basic_publish(
-                    outputchan,
-                    &routing_key,
-                    BasicPublishOptions::default(),
-                    &payload,
-                    BasicProperties::default(),
-                ).await?; // Note: await sur publish attend juste la confirmation d'envoi réseau
+                channel
+                    .basic_publish(
+                        outputchan,
+                        &routing_key,
+                        BasicPublishOptions::default(),
+                        &payload,
+                        BasicProperties::default(),
+                    )
+                    .await?; // Note: await sur publish attend juste la confirmation d'envoi réseau
             }
         }
     }
@@ -677,19 +721,23 @@ pub enum AlignAlgo {
     Ok(())
 }
 
-
 /// Logique cœur du Worker
-async fn process_message(channel: &Channel, data: &[u8],
+async fn process_message(
+    channel: &Channel,
+    data: &[u8],
     debug: bool,
     server_url: &str,
     bucket_name: &str,
     login: &str,
     pass: &str,
-       mq_server_ouputqueue: &String
+    mq_server_ouputqueue: &String,
 ) -> Result<(), Box<dyn Error>> {
     // 1. Désérialisation
     let request: ScanRequest = serde_json::from_slice(data)?;
-    println!("   Détails : Scan ID {}, Pages '{}', Algo {}", request.scan_id, request.pages_to_manage, request.algo);
+    println!(
+        "   Détails : Scan ID {}, Pages '{}', Algo {}",
+        request.scan_id, request.pages_to_manage, request.algo
+    );
 
     // 2. Parsing des pages
     let pages = parse_page_selection(&request.pages_to_manage).unwrap_or_default();
@@ -705,6 +753,9 @@ async fn process_message(channel: &Channel, data: &[u8],
         request.exam_id,
         request.template_id,
         request.scan_id,
+        request.heightresolution,
+        request.corner_square_size,
+        request.min_radius,
         match request.algo {
             0 => AlignAlgo::NoAlign,
             1 => AlignAlgo::CircleAlign,
@@ -717,27 +768,29 @@ async fn process_message(channel: &Channel, data: &[u8],
         login,
         pass,
         Some(channel),
-        mq_server_ouputqueue
-    ).await?;
+        mq_server_ouputqueue,
+    )
+    .await?;
 
- 
     // 5. Message final de complétion
     let final_key = format!("scan.status.{}", request.scan_id);
     let final_msg = ScanStatus {
-        scan_id: request.exam_id,
+        exam_id: request.exam_id,
         page: 0,
         status: "finished".to_string(),
         progress: 100,
         details: "Traitement complet terminé".to_string(),
     };
-    
-    channel.basic_publish(
-        mq_server_ouputqueue,
-        &final_key,
-        BasicPublishOptions::default(),
-        &serde_json::to_vec(&final_msg)?,
-        BasicProperties::default(),
-    ).await?;
+
+    channel
+        .basic_publish(
+            mq_server_ouputqueue,
+            &final_key,
+            BasicPublishOptions::default(),
+            &serde_json::to_vec(&final_msg)?,
+            BasicProperties::default(),
+        )
+        .await?;
 
     Ok(())
 }

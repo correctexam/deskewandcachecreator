@@ -118,18 +118,19 @@ pub fn validate_rms(circle: &Circle, points: &[(f32, f32)], max_ratio: f32) -> b
 pub fn detect_circles_in_four_corners_advanced(
     gray: &GrayImage,
     roi_size: u32,
+    min_radius: f32
 ) -> Vec<Option<Circle>> {
     let w = gray.width();
     let h = gray.height();
     vec![
         // Coin haut-gauche
-        detect_circle_roi_advanced(gray, 1, 1, roi_size - 1),
+        detect_circle_roi_advanced(gray, 1, 1, roi_size - 1,min_radius),
         // Coin haut-droit
-        detect_circle_roi_advanced(gray, w - roi_size, 0, roi_size),
+        detect_circle_roi_advanced(gray, w - roi_size, 0, roi_size,min_radius),
         // Coin bas-gauche
-        detect_circle_roi_advanced(gray, 1, h - roi_size, roi_size - 1),
+        detect_circle_roi_advanced(gray, 1, h - roi_size, roi_size - 1,min_radius),
         // Coin bas-droit
-        detect_circle_roi_advanced(gray, w - roi_size, h - roi_size, roi_size),
+        detect_circle_roi_advanced(gray, w - roi_size, h - roi_size, roi_size,min_radius),
     ]
 }
 
@@ -156,7 +157,7 @@ fn extract_border_points(bin: &Vec<Vec<u8>>, w: usize, h: usize) -> Vec<(usize, 
     pts
 }
 
-pub fn detect_circle_roi_advanced(gray: &GrayImage, x0: u32, y0: u32, size: u32) -> Option<Circle> {
+pub fn detect_circle_roi_advanced(gray: &GrayImage, x0: u32, y0: u32, size: u32, min_radius: f32) -> Option<Circle> {
     // (Seuil Otsu + morphologie identiques à avant)
     let roi = gray.view(x0, y0, size, size).to_image();
     let t = otsu_threshold(&roi);
@@ -179,7 +180,7 @@ pub fn detect_circle_roi_advanced(gray: &GrayImage, x0: u32, y0: u32, size: u32)
         &bin,
         size as usize,
         size as usize,
-        10.0, // rayon min
+        min_radius, // rayon min
     );
 
     let border_pixels = extract_border_points(&bin, size as usize, size as usize);
