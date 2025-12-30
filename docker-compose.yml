@@ -15,6 +15,11 @@ services:
       RABBITMQ_DEFAULT_USER: rabbitmq
       RABBITMQ_DEFAULT_PASS: rabbitmq
 
+
+  pdf_to_webp:
+    image: barais/pdf_to_webp
+    command: ["./pdf_to_webp", "--mq","--mq-server-host","rabbitmq"]
+
 volumes:
   rabbitmq-data:
     driver: local
