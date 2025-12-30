@@ -31,4 +31,17 @@ Ce projet est fourni à titre d'exemple éducatif et technique. Libre à vous de
 
 ```bash
 amqp-publish --url="amqp://rabbitmq:rabbitmq@localhost:5672"     --routing-key="scan_jobs_queue"     --body='{"pages_to_manage": "1-3", "exam_id": 855, "template_id": 857, "scan_id": 607, "algo": 2}'
+
+curl -X POST http://localhost:8080/api/scansalign \
+     -H "Content-Type: application/json" \
+     -d '{
+           "pages_to_manage": "1-3",
+           "exam_id": 855,
+           "template_id": 857,
+           "scan_id": 607,
+           "algo": 2,
+           "heightresolution":2000,
+           "corner_square_size":300,
+           "min_radius":10.0
+         }'
 ```

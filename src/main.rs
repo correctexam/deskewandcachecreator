@@ -42,7 +42,7 @@ struct Args {
 #[command(version, about, long_about = None)]
 struct Args {
     /// Pages To Process
-    #[arg(short, long)]
+    #[arg(short, long,default_value="")]
     pages_to_manage: String,
 
     /// Exam Id
@@ -242,7 +242,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     args.server_url.as_str(),
                     args.bucket_name.as_str(),
                     args.minio_login.as_str(),
-                    args.minio_login.as_str(),
+                    args.minio_pass.as_str(),
                     &args.mq_server_ouputqueue,
                 )
                 .await
@@ -747,6 +747,7 @@ async fn process_message(
         println!("   Aucune page à traiter.");
         return Ok(());
     }
+        println!("  radius {}",request.min_radius);
 
     process_exam(
         pages,
