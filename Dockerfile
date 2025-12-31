@@ -1,28 +1,24 @@
 ARG RUST_VERSION=1.92.0
 ARG APP_NAME=pdf_to_webp
 
-FROM rust:${RUST_VERSION}-alpine AS builder
-ARG APP_NAME
-WORKDIR /usr/src/
+FROM rust:${RUST_VERSION}-trixie AS builder
 
 
 # Build Stage
-RUN rustup target add x86_64-unknown-linux-musl
 
-RUN USER=root cargo new ${APP_NAME}
-WORKDIR /usr/src/${APP_NAME}
+WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-COPY akaze/Cargo.toml akaze/Cargo.lock ./akaze/
 COPY akaze ./akaze
 COPY src ./src
-
+COPY libpdfium.so ./libpdfium.so
 RUN cargo build --release
 
-RUN cargo install --target x86_64-unknown-linux-musl --path .
 
 # Bundle Stage
-FROM scratch
-COPY --from=builder /usr/local/cargo/bin/pdf_to_webp .
+FROM  debian:trixie-slim
+WORKDIR /app
+COPY --from=builder /app/target/release/pdf_to_webp .
+COPY --from=builder /app/libpdfium.so .
 USER 1000
 CMD ["./pdf_to_webp", "--mq"]
 

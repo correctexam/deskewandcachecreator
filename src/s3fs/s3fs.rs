@@ -11,7 +11,7 @@ pub async fn get_object(
     pass: &str,
 ) -> Result<ResponseData, S3Error> {
     // This requires a running minio server at localhost:9000
-
+  //  println!("{} {} {} {} {}",server_url,bucket_name,s3_path,login,pass);
     let region = Region::Custom {
         region: "eu-central-1".to_owned(),
         endpoint:server_url.to_owned(),
@@ -32,9 +32,13 @@ pub async fn get_object(
         .bucket;
     }
 
-    let response_data: s3::request::ResponseData = bucket.get_object(s3_path).await?;
-    assert_eq!(response_data.status_code(), 200);
-    Ok(response_data)
+    let objexist = bucket.object_exists(s3_path).await?;
+    if objexist{
+        let response_data: s3::request::ResponseData = bucket.get_object(s3_path).await?;
+        assert_eq!(response_data.status_code(), 200);
+        return Ok(response_data)
+    }
+    return  Err(S3Error::HttpFail);
 }
 
 
@@ -47,6 +51,7 @@ pub async  fn put_object(
     pass: &str,
 ) -> Result<ResponseData, S3Error> {
     // This requires a running minio server at localhost:9000
+
 
     let region = Region::Custom {
         region: "eu-central-1".to_owned(),
@@ -69,6 +74,10 @@ pub async  fn put_object(
     }
 
     let response_data: s3::request::ResponseData = bucket.put_object(s3_path,content).await?;
-    assert_eq!(response_data.status_code(), 200);
-    Ok(response_data)
+    // assert_eq!(response_data.status_code(), 200);
+    if response_data.status_code()== 200{
+        Ok(response_data)
+    } else {
+        Err(S3Error::HttpFail)
+    }
 }

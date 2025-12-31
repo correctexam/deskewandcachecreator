@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose};
 use image::{DynamicImage, EncodableLayout}; // Importez RgbImage si vous l'utilisez souvent
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
 use core::result::Result;
@@ -25,8 +25,8 @@ const WEBP_DATA_PREFIX: &str = "data:image/webp;base64,";
 
 /// Crée la table (structure identique)
 pub fn create_connection(exam_id: u32) -> Result<Connection, rusqlite::Error> {
-    let str = format!("{}.sqlite3", exam_id);
-    let conn = Connection::open(str)?;
+    let str = format!("/tmp/{}.sqlite3", exam_id);
+    let conn = Connection::open_with_flags(str,OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     create_table(&conn, exam_id)?;
     Ok(conn)
 }

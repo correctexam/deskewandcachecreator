@@ -36,12 +36,16 @@ curl -X POST http://localhost:8080/api/scansalign \
      -H "Content-Type: application/json" \
      -d '{
            "pages_to_manage": "1-3",
-           "exam_id": 855,
-           "template_id": 857,
-           "scan_id": 607,
+           "exam_id": 1,
+           "template_id": 1,
+           "scan_id": 1,
            "algo": 2,
            "heightresolution":2000,
            "corner_square_size":300,
            "min_radius":10.0
          }'
 ```
+
+## TODO
+
+- [ ] drop value before insert

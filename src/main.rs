@@ -325,8 +325,12 @@ async fn process_exam(
             login,
             pass,
         )
-        .await?;
-        fs::write(format!("{}.sqlite3", exam_id), existingcache.bytes())?;
+        .await;
+        if existingcache.is_ok(){
+            fs::write(format!("/tmp/{}.sqlite3", exam_id), existingcache?.bytes())?;
+        } else {
+            println!("pas de cache");
+        }
     }
 
     let conn = create_connection(exam_id)?;
@@ -346,8 +350,15 @@ async fn process_exam(
         login,
         pass,
     )
-    .await?;
-    let templatedata = template.bytes().to_vec();
+    .await;
+    if template.is_err(){
+        if fs::exists(format!("/tmp/{}.sqlite3", exam_id))?{
+            fs::remove_file(format!("/tmp/{}.sqlite3", exam_id))?;
+        }
+
+        return Ok(());
+    }
+    let templatedata = template?.bytes().to_vec();
     let cursor = Cursor::new(templatedata);
     let document_template = PdfiumDocument::new_from_reader(cursor, None).unwrap();
     let scan = get_object(
@@ -357,8 +368,17 @@ async fn process_exam(
         login,
         pass,
     )
-    .await?;
-    let scan_data = scan.bytes().to_vec();
+    .await;
+    if scan.is_err(){
+        drop(document_template);
+        if fs::exists(format!("/tmp/{}.sqlite3", exam_id))?{
+            fs::remove_file(format!("/tmp/{}.sqlite3", exam_id))?;
+        }
+
+        return Ok(());
+    }
+
+    let scan_data = scan?.bytes().to_vec();
     let cursorscan = Cursor::new(scan_data);
     let document_scan = PdfiumDocument::new_from_reader(cursorscan, None).unwrap();
 
@@ -702,11 +722,11 @@ async fn process_exam(
             }
         }
     }
-
     drop(document_scan); // Demonstrate that the page can be used after the document is dropped.
     drop(document_template); // Demonstrate that the page can be used after the document is dropped.
     let _ = close_connection(conn);
-    let content = fs::read(format!("{}.sqlite3", exam_id))?;
+    let content = fs::read(format!("/tmp/{}.sqlite3", exam_id))?;
+    println!("pass par la");
 
     let _ = put_object(
         server_url,
@@ -715,8 +735,9 @@ async fn process_exam(
         &format!("cache/{}.sqlite3", exam_id),
         login,
         pass,
-    );
-    fs::remove_file(format!("{}.sqlite3", exam_id))?;
+    ).await?;
+    println!("pass par la1");
+//    fs::remove_file(format!("/tmp/{}.sqlite3", exam_id))?;
 
     Ok(())
 }
