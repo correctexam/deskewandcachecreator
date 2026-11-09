@@ -61,7 +61,7 @@ struct Args {
     #[arg(short, long, default_value_t = 1)]
     algo: u8, // 0=NoAlign,1=CircleAlign,2=Akaze
 
-    #[arg(short, long, default_value_t = 2000)]
+    #[arg( long, default_value_t = 2000)]
     heightresolution: i32,
     #[arg(short, long, default_value_t = 300)]
     corner_square_size: u32,
@@ -72,31 +72,31 @@ struct Args {
     #[arg(long, short, action, default_value_t = false)]
     debug: bool, //allow debug
 
-    #[arg(long, short, action, default_value_t = false)]
+    #[arg(long, action, default_value_t = false)]
     mq: bool, //allow debug
 
-    #[arg(long, short, default_value = "localhost")]
+    #[arg(long, default_value = "localhost")]
     mq_server_host: String,
 
-    #[arg(long, short, default_value = "5672")]
+    #[arg(long, default_value = "5672")]
     mq_server_port: u32,
 
-    #[arg(long, short, default_value = "rabbitmq")]
+    #[arg(long, default_value = "rabbitmq")]
     mq_server_login: String,
-    #[arg(long, short, default_value = "rabbitmq")]
+    #[arg(long, default_value = "rabbitmq")]
     mq_server_pass: String,
-    #[arg(long, short, default_value = "scan_jobs_queue")]
+    #[arg(long, default_value = "scan_jobs_queue")]
     mq_server_inputqueue: String,
-    #[arg(long, short, default_value = "scan_status_exchange")]
+    #[arg(long, default_value = "scan_status_exchange")]
     mq_server_ouputqueue: String,
 
-    #[arg(long, short, default_value = "http://localhost:9000")]
+    #[arg(long, default_value = "http://localhost:9000")]
     server_url: String,
-    #[arg(long, short, default_value = "test")]
+    #[arg(long, default_value = "test")]
     bucket_name: String,
-    #[arg(long, short, default_value = "admin")]
+    #[arg(long,  default_value = "admin")]
     minio_login: String,
-    #[arg(long, short, default_value = "minioadmin")]
+    #[arg(long,  default_value = "minioadmin")]
     minio_pass: String,
 }
 
@@ -724,20 +724,25 @@ async fn process_exam(
     }
     drop(document_scan); // Demonstrate that the page can be used after the document is dropped.
     drop(document_template); // Demonstrate that the page can be used after the document is dropped.
+    
+    let _ = update_dt(&conn);
+    
     let _ = close_connection(conn);
     let content = fs::read(format!("/tmp/{}.sqlite3", exam_id))?;
-    println!("pass par la");
 
-    let _ = put_object(
+    let res  = put_object(
         server_url,
         bucket_name,
         content.as_slice(),
         &format!("cache/{}.sqlite3", exam_id),
         login,
         pass,
-    ).await?;
-    println!("pass par la1");
-//    fs::remove_file(format!("/tmp/{}.sqlite3", exam_id))?;
+    ).await;
+       match res {
+        Ok(_) => println!("✅ Cache sauvegardé avec succès pour l'exam {}.", exam_id),
+        Err(e) => eprintln!("❌ Erreur lors de la sauvegarde du cache pour l'exam {}: {}", exam_id, e),
+    }
+    fs::remove_file(format!("/tmp/{}.sqlite3", exam_id))?;
 
     Ok(())
 }

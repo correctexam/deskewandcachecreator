@@ -1,9 +1,8 @@
 use base64::{Engine as _, engine::general_purpose};
 use image::{DynamicImage, EncodableLayout}; // Importez RgbImage si vous l'utilisez souvent
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, Result, params};
 use serde::{Deserialize, Serialize};
-use serde_json::to_string_pretty;
-use core::result::Result;
+use serde_json::{ to_string_pretty};
 
 // Pour la partie DB :
 use webp::{Encoder}; // Ajout de la crate webp
@@ -26,9 +25,19 @@ const WEBP_DATA_PREFIX: &str = "data:image/webp;base64,";
 /// Crée la table (structure identique)
 pub fn create_connection(exam_id: u32) -> Result<Connection, rusqlite::Error> {
     let str = format!("/tmp/{}.sqlite3", exam_id);
-    let conn = Connection::open_with_flags(str,OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    let conn  = Connection::open_with_flags(str,OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     create_table(&conn, exam_id)?;
     Ok(conn)
+}
+
+pub fn update_dt(conn : &Connection) -> Result<(), rusqlite::Error> {
+    let res = conn.execute("UPDATE exam SET DT = CURRENT_TIMESTAMP WHERE id = 1", []);
+    match res {
+        Ok(_) => println!("✅ Date de mise à jour modifiée avec succès."),
+        Err(e) => eprintln!("❌ Erreur lors de la mise à jour de la date : {}", e),
+        
+    };
+    Ok(())
 }
 
 /// Crée la table (structure identique)
@@ -42,33 +51,40 @@ fn create_table(conn: &Connection, exam_id: u32) -> Result<(), rusqlite::Error> 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS template (
             page INTEGER NOT NULL PRIMARY KEY,
-            imageData CLOB NOT NULL,
-            width INTEGER,
-            height INTEGER            
+            imageData CLOB NOT NULL   
         );",
         [],
     )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS align (
             page INTEGER NOT NULL PRIMARY KEY,
-            imageData CLOB NOT NULL,
-            width INTEGER,
-            height INTEGER            
+            imageData CLOB NOT NULL
         );",
         [],
     )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS nonalign (
             page INTEGER NOT NULL PRIMARY KEY,
-            imageData CLOB NOT NULL,
-            width INTEGER,
-            height INTEGER            
+            imageData CLOB NOT NULL
         );",
         [],
     )?;
     conn.execute("CREATE TABLE IF NOT EXISTS exam(id INTEGER NOT NULL PRIMARY KEY, DT datetime default current_timestamp)",
         [],
     )?;
+
+    conn.execute("CREATE TRIGGER IF NOT EXISTS  ttemplate   AFTER UPDATE ON template BEGIN UPDATE exam SET DT = CURRENT_TIMESTAMP WHERE id = 1; END;",
+        [],
+    )?;
+    conn.execute("CREATE TRIGGER IF NOT EXISTS talign    AFTER UPDATE ON align BEGIN UPDATE exam SET DT = CURRENT_TIMESTAMP WHERE id = 1; END;",
+        [],
+    )?;
+    conn.execute("CREATE TRIGGER IF NOT EXISTS  tnonalign  AFTER UPDATE ON nonalign BEGIN UPDATE exam SET DT = CURRENT_TIMESTAMP WHERE id = 1; END;",
+        [],
+    )?;
+
+
+
     let _ = conn.execute(
         "INSERT OR IGNORE INTO exam(id) VALUES (?)",
         params![exam_id],
@@ -120,22 +136,37 @@ pub fn save_image_to_db_webp(
     // 2. Sérialisation en JSON (Struct -> String JSON)
     match to_string_pretty(&doc) {
         Ok(json_output) => {
-            println!("--- JSON Généré ---");
             if state == ImageState::Template {
-                conn.execute(
-                    "INSERT INTO template (page, width, height, imageData) VALUES (?1, ?2, ?3, ?4)",
-                    params![page, w, h, json_output],
-                )?;
+                println!("---  Insertion base  --- template");
+               let res = conn.execute(
+                    "INSERT INTO template (page, imageData) VALUES (?1, ?2) ON CONFLICT(page) DO UPDATE SET  imageData = excluded.imageData",
+                    params![page, json_output],
+                );
+                match res {
+                    Ok(_) => println!("image template saved"),
+                    Err(e) => println!("image template not saved {}",e),
+                }
             } else if state == ImageState::Align {
-                conn.execute(
-                    "INSERT INTO align (page, width, height, imageData) VALUES (?1, ?2, ?3, ?4)",
-                    params![page, w, h, json_output],
-                )?;
+                println!("--- Insertion base --- align ");
+                let res = conn.execute(
+                    "INSERT INTO align (page, imageData) VALUES (?1, ?2) ON CONFLICT(page) DO UPDATE SET imageData = excluded.imageData",
+                    params![page, json_output],
+                );
+                match res {
+                    Ok(_) => println!("image align saved"),
+                    Err(e) => println!("image align not saved {}",e),
+                }
             } else {
-                conn.execute(
-                    "INSERT INTO nonalign (page, width, height, imageData) VALUES (?1, ?2, ?3, ?4)",
-                    params![page, w, h, json_output],
-                )?;
+                println!("--- Insertion base --- nonalign");
+
+                let res = conn.execute(
+                    "INSERT INTO nonalign (page, imageData) VALUES (?1, ?2) ON CONFLICT(page) DO UPDATE SET imageData = excluded.imageData",
+                    params![page, json_output],
+                );
+                match res {
+                    Ok(_) => println!("image nonalign saved"),
+                    Err(e) => println!("image nonalign not saved {}",e),
+                }
             }
         }
         Err(e) => eprintln!("Erreur de sérialisation : {}", e),
