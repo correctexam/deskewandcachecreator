@@ -1,1 +1,9 @@
 /target
+
+# Test data and generated outputs: keep them out of the repository
+*.pdf
+*.db
+*_webp_images/
+/tree
+
+# Cargo.lock is intentionally versioned (binary crate, required by the Dockerfile)
