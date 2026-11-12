@@ -25,94 +25,136 @@ pub struct SimilarityTransform {
 }
 
 
-pub fn flood_fill(
-    bin: &mut Vec<Vec<u8>>,
-    x0: usize,
-    y0: usize,
-    label: u8,
-    w: usize,
-    h: usize,
-    pixels: &mut Vec<(usize, usize)>,
-) {
-    let mut stack = vec![(x0, y0)];
-    bin[y0][x0] = label;
+/// Seuils de reconnaissance d'un rond de calage plein.
+const MIN_DISK_FILL_RATIO: f32 = 0.80; // un carré plein donne 4/π ≈ 1,27
+const MAX_DISK_FILL_RATIO: f32 = 1.15;
+const MAX_DISK_ASPECT_RATIO: f32 = 1.3; // largeur / hauteur de la boîte englobante
+/// Tolérance de l'ajustement : 5 % du rayon, mais jamais moins d'un pixel
+/// (l'erreur de discrétisation du contour approche 0,5 px sur les petits ronds).
+const MAX_RMS_RATIO: f32 = 0.05;
+const MIN_RMS_TOLERANCE_PX: f32 = 1.0;
 
-    while let Some((x, y)) = stack.pop() {
-        pixels.push((x, y));
+/// Composante connexe (4-connexité) d'une image binaire.
+struct Blob {
+    pixels: Vec<(usize, usize)>,
+    minx: usize,
+    maxx: usize,
+    miny: usize,
+    maxy: usize,
+}
 
-        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-            let nx = x as isize + dx;
-            let ny = y as isize + dy;
-
-            if nx >= 0 && ny >= 0 && nx < w as isize && ny < h as isize {
-                let nx = nx as usize;
-                let ny = ny as usize;
-                if bin[ny][nx] == 1 {
-                    bin[ny][nx] = label;
-                    stack.push((nx, ny));
-                }
-            }
-        }
+impl Blob {
+    fn width(&self) -> usize {
+        self.maxx - self.minx + 1
+    }
+    fn height(&self) -> usize {
+        self.maxy - self.miny + 1
     }
 }
 
-pub fn filter_filled_circles(bin: &Vec<Vec<u8>>, w: usize, h: usize, min_radius: f32) -> Vec<Vec<u8>> {
-    let mut bin = bin.clone();
-    let mut label: u8 = 2;
+/// Étiquetage sans limite de nombre de composantes (l'ancienne étiquette `u8`
+/// débordait au-delà de 254 composantes et pouvait boucler indéfiniment).
+fn connected_components(bin: &[Vec<u8>], w: usize, h: usize) -> Vec<Blob> {
+    let mut visited = vec![vec![false; w]; h];
+    let mut blobs = Vec::new();
 
-    let mut output = vec![vec![0u8; w]; h];
-
-    for y in 0..h {
-        for x in 0..w {
-            if bin[y][x] == 1 {
-                let mut pixels = Vec::new();
-                flood_fill(&mut bin, x, y, label, w, h, &mut pixels);
-
-                let mut minx = w;
-                let mut maxx = 0;
-                let mut miny = h;
-                let mut maxy = 0;
-
-                for &(px, py) in &pixels {
-                    minx = minx.min(px);
-                    maxx = maxx.max(px);
-                    miny = miny.min(py);
-                    maxy = maxy.max(py);
-                }
-
-                let width = (maxx - minx + 1) as f32;
-                let height = (maxy - miny + 1) as f32;
-                let radius = (width.min(height)) / 2.0;
-
-                let area_pixels = pixels.len() as f32;
-                let area_circle = std::f32::consts::PI * radius * radius;
-                let fill_ratio = area_pixels / area_circle;
-
-                if radius > min_radius && fill_ratio > 0.7 {
-                    // ✔ cercle plein valide → on conserve
-                    for &(px, py) in &pixels {
-                        output[py][px] = 1;
+    for y0 in 0..h {
+        for x0 in 0..w {
+            if bin[y0][x0] != 1 || visited[y0][x0] {
+                continue;
+            }
+            let mut blob = Blob { pixels: Vec::new(), minx: x0, maxx: x0, miny: y0, maxy: y0 };
+            let mut stack = vec![(x0, y0)];
+            visited[y0][x0] = true;
+            while let Some((x, y)) = stack.pop() {
+                blob.pixels.push((x, y));
+                blob.minx = blob.minx.min(x);
+                blob.maxx = blob.maxx.max(x);
+                blob.miny = blob.miny.min(y);
+                blob.maxy = blob.maxy.max(y);
+                let neighbours = [
+                    (x.wrapping_sub(1), y),
+                    (x + 1, y),
+                    (x, y.wrapping_sub(1)),
+                    (x, y + 1),
+                ];
+                for (nx, ny) in neighbours {
+                    if nx < w && ny < h && bin[ny][nx] == 1 && !visited[ny][nx] {
+                        visited[ny][nx] = true;
+                        stack.push((nx, ny));
                     }
                 }
+            }
+            blobs.push(blob);
+        }
+    }
+    blobs
+}
 
-                label += 1;
+/// Une composante est un rond plein candidat si elle est entièrement dans la
+/// zone (un rond coupé par le bord donne une corde droite), à peu près aussi
+/// large que haute et remplie comme un disque.
+fn is_disk_candidate(blob: &Blob, w: usize, h: usize, min_radius: f32) -> bool {
+    // erode/dilate mettent à 0 la première et la dernière ligne/colonne
+    if blob.minx <= 1 || blob.miny <= 1 || blob.maxx + 2 >= w || blob.maxy + 2 >= h {
+        return false;
+    }
+    let bw = blob.width() as f32;
+    let bh = blob.height() as f32;
+    if bw.max(bh) / bw.min(bh) > MAX_DISK_ASPECT_RATIO {
+        return false;
+    }
+    let radius = (bw + bh) / 4.0;
+    if radius <= min_radius {
+        return false;
+    }
+    let fill_ratio = blob.pixels.len() as f32 / (std::f32::consts::PI * radius * radius);
+    (MIN_DISK_FILL_RATIO..=MAX_DISK_FILL_RATIO).contains(&fill_ratio)
+}
+
+/// Contour (pixels ayant un voisin hors composante) d'une seule composante.
+fn blob_border_points(blob: &Blob, x0: u32, y0: u32) -> Vec<(f32, f32)> {
+    let w = blob.width() + 2;
+    let h = blob.height() + 2;
+    let mut mask = vec![vec![false; w]; h];
+    for &(x, y) in &blob.pixels {
+        mask[y - blob.miny + 1][x - blob.minx + 1] = true;
+    }
+    blob.pixels
+        .iter()
+        .filter(|&&(x, y)| {
+            let (lx, ly) = (x - blob.minx + 1, y - blob.miny + 1);
+            !(mask[ly - 1][lx] && mask[ly + 1][lx] && mask[ly][lx - 1] && mask[ly][lx + 1])
+        })
+        .map(|&(x, y)| (x as f32 + x0 as f32, y as f32 + y0 as f32))
+        .collect()
+}
+
+/// Conservé pour compatibilité : ne garde que les composantes qui ressemblent
+/// à un rond plein entièrement contenu dans la zone.
+pub fn filter_filled_circles(bin: &Vec<Vec<u8>>, w: usize, h: usize, min_radius: f32) -> Vec<Vec<u8>> {
+    let mut output = vec![vec![0u8; w]; h];
+    for blob in connected_components(bin, w, h) {
+        if is_disk_candidate(&blob, w, h, min_radius) {
+            for &(px, py) in &blob.pixels {
+                output[py][px] = 1;
             }
         }
     }
-
     output
 }
 
+/// Écart quadratique moyen (en pixels) entre les points et le cercle.
+pub fn circle_rms(circle: &Circle, points: &[(f32, f32)]) -> f32 {
+    let err2: f32 = points
+        .iter()
+        .map(|(x, y)| (((x - circle.cx).powi(2) + (y - circle.cy).powi(2)).sqrt() - circle.r).powi(2))
+        .sum();
+    (err2 / points.len() as f32).sqrt()
+}
+
 pub fn validate_rms(circle: &Circle, points: &[(f32, f32)], max_ratio: f32) -> bool {
-    let mut err2 = 0.0;
-
-    for (x, y) in points {
-        let d = ((x - circle.cx).powi(2) + (y - circle.cy).powi(2)).sqrt();
-        err2 += (d - circle.r).powi(2);
-    }
-
-    let rms = (err2 / points.len() as f32).sqrt();
-    rms < circle.r * max_ratio
+    circle_rms(circle, points) < (circle.r * max_ratio).max(MIN_RMS_TOLERANCE_PX)
 }
 
 pub fn detect_circles_in_four_corners_advanced(
@@ -158,48 +200,42 @@ fn extract_border_points(bin: &Vec<Vec<u8>>, w: usize, h: usize) -> Vec<(usize, 
 }
 
 pub fn detect_circle_roi_advanced(gray: &GrayImage, x0: u32, y0: u32, size: u32, min_radius: f32) -> Option<Circle> {
-    // (Seuil Otsu + morphologie identiques à avant)
     let roi = gray.view(x0, y0, size, size).to_image();
+    // Otsu : la classe sombre regroupe les niveaux <= t
     let t = otsu_threshold(&roi);
+    let n = size as usize;
 
-    //    println!(" {} ",t);
-    let mut bin = vec![vec![0u8; size as usize]; size as usize];
+    let mut bin = vec![vec![0u8; n]; n];
     for y in 0..size {
         for x in 0..size {
-            bin[y as usize][x as usize] = if roi.get_pixel(x, y)[0] < t { 1 } else { 0 };
+            bin[y as usize][x as usize] = if roi.get_pixel(x, y)[0] <= t { 1 } else { 0 };
         }
     }
+    let bin = dilate(&erode(&bin, n, n), n, n);
 
-    let bin = dilate(
-        &erode(&bin, size as usize, size as usize),
-        size as usize,
-        size as usize,
-    );
+    // Un seul rond est ajusté : le plus grand candidat. Avant, le contour de
+    // toutes les composantes retenues (texte, case noircie, ombre de bord…)
+    // était ajusté comme un seul cercle, d'où un RMS élevé.
+    let blobs = connected_components(&bin, n, n);
+    let Some(blob) = blobs
+        .iter()
+        .filter(|b| is_disk_candidate(b, n, n, min_radius))
+        .max_by_key(|b| b.pixels.len())
+    else {
+        println!("    ! Aucun rond plein entier dans la zone ({x0}, {y0}, {size}px)");
+        return None;
+    };
 
-    let bin = filter_filled_circles(
-        &bin,
-        size as usize,
-        size as usize,
-        min_radius, // rayon min
-    );
-
-    let border_pixels = extract_border_points(&bin, size as usize, size as usize);
-
-    let mut points = Vec::new();
-    for (x, y) in border_pixels {
-        points.push((x as f32 + x0 as f32, y as f32 + y0 as f32));
-    }
-
+    let points = blob_border_points(blob, x0, y0);
     let circle = fit_circle_taubin(&points)?;
-    if !validate_rms(&circle, &points, 0.05) {
-        println!("    ! Avertissement : RMS trop élevé pour le cercle détecté.");
+    let rms = circle_rms(&circle, &points);
+    if !validate_rms(&circle, &points, MAX_RMS_RATIO) {
+        println!(
+            "    ! Avertissement : RMS trop élevé pour le cercle détecté (zone ({x0}, {y0}), rayon {:.1}px, RMS {:.2}px)",
+            circle.r, rms
+        );
         return None;
     }
-
-    /*    if !validate_radial_gradient(gray, &circle, &points) {
-        println!("    ! Avertissement : Gradient radial non valide.");
-        // return None;
-    } */
 
     Some(circle)
 }
@@ -812,3 +848,69 @@ pub fn estimate_similarity_3pts(src: &[Point; 3], dst: &[Point; 3]) -> Similarit
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Luma;
+    fn page(w: u32, h: u32, shapes: &[&dyn Fn(f32, f32) -> bool]) -> GrayImage {
+        GrayImage::from_fn(w, h, |x, y| {
+            let (xf, yf) = (x as f32 + 0.5, y as f32 + 0.5);
+            if shapes.iter().any(|s| s(xf, yf)) { Luma([20]) } else { Luma([235]) }
+        })
+    }
+    fn disk(cx: f32, cy: f32, r: f32) -> impl Fn(f32, f32) -> bool {
+        move |x, y| (x - cx).powi(2) + (y - cy).powi(2) <= r * r
+    }
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> impl Fn(f32, f32) -> bool {
+        move |x, y| x >= x0 && x < x1 && y >= y0 && y < y1
+    }
+    fn assert_close(c: &Circle, cx: f32, cy: f32) {
+        assert!((c.cx - cx).abs() < 1.0 && (c.cy - cy).abs() < 1.0, "{c:?} attendu ({cx},{cy})");
+    }
+
+    #[test]
+    fn rond_seul_detecte() {
+        let img = page(300, 300, &[&disk(120.0, 140.0, 25.0)]);
+        assert_close(&detect_circle_roi_advanced(&img, 0, 0, 300, 10.0).expect("rond"), 120.0, 140.0);
+    }
+    #[test]
+    fn petit_rond_accepte_malgre_la_discretisation() {
+        let img = page(300, 300, &[&disk(150.3, 149.7, 11.0)]);
+        assert!(detect_circle_roi_advanced(&img, 0, 0, 300, 10.0).is_some());
+    }
+    #[test]
+    fn rond_et_rectangle_noir_dans_le_meme_coin() {
+        let img = page(300, 300, &[&disk(100.0, 100.0, 25.0), &rect(200.0, 40.0, 260.0, 70.0)]);
+        assert_close(&detect_circle_roi_advanced(&img, 0, 0, 300, 10.0).expect("rond"), 100.0, 100.0);
+    }
+    #[test]
+    fn rond_et_carre_noir_plus_grand() {
+        let img = page(300, 300, &[&disk(80.0, 220.0, 20.0), &rect(150.0, 50.0, 230.0, 130.0)]);
+        assert_close(&detect_circle_roi_advanced(&img, 0, 0, 300, 10.0).expect("rond"), 80.0, 220.0);
+    }
+    #[test]
+    fn rond_coupe_par_le_bord_de_la_zone_rejete() {
+        let img = page(300, 300, &[&disk(10.0, 150.0, 30.0)]);
+        assert!(detect_circle_roi_advanced(&img, 0, 0, 300, 10.0).is_none());
+    }
+    #[test]
+    fn beaucoup_de_taches_ne_bloquent_pas() {
+        let mut shapes: Vec<Box<dyn Fn(f32, f32) -> bool>> = Vec::new();
+        for i in 0..20 { for j in 0..20 {
+            let (x, y) = (5.0 + i as f32 * 9.0, 5.0 + j as f32 * 9.0);
+            shapes.push(Box::new(rect(x, y, x + 4.0, y + 4.0)));
+        }}
+        shapes.push(Box::new(disk(240.0, 240.0, 25.0)));
+        let refs: Vec<&dyn Fn(f32, f32) -> bool> = shapes.iter().map(|b| b.as_ref()).collect();
+        let img = page(300, 300, &refs);
+        assert_close(&detect_circle_roi_advanced(&img, 0, 0, 300, 10.0).expect("rond"), 240.0, 240.0);
+    }
+    #[test]
+    fn coin_bas_droit_coordonnees_page() {
+        let img = page(1400, 2000, &[&disk(1330.0, 1925.0, 22.0)]);
+        let f = detect_circles_in_four_corners_advanced(&img, 300, 10.0);
+        assert!(f[0].is_none() && f[1].is_none() && f[2].is_none());
+        assert_close(f[3].as_ref().unwrap(), 1330.0, 1925.0);
+    }
+}

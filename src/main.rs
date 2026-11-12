@@ -553,21 +553,21 @@ async fn process_exam(
                 let mut dst_points = [Point { x: 0.0, y: 0.0 }; 4];
                 let mut missing_round = 0;
                 let mut missing_round_index = 0;
+                let pagemod = page_mod(page_num, template_circle_map.len()).unwrap() as u32;
+                let template_circles = template_circle_map.get(&pagemod);
                 for (i, c) in circles.iter().enumerate() {
-                    let pagemod = &(page_mod(page_num, template_circle_map.len()).unwrap() as u32);
-                    if c.is_none() {
-                        missing_round = missing_round + 1;
-                        missing_round_index = i;
-                    } else if c.is_some() && template_circle_map.get(pagemod).is_some() {
-                        let template_circles = template_circle_map.get(pagemod).unwrap();
-                        if template_circles[i].is_some() {
-                            let tc = template_circles[i].as_ref().unwrap();
-                            let c_unwrap = c.as_ref().unwrap();
-                            src_points[i] = Point {
-                                x: c_unwrap.cx,
-                                y: c_unwrap.cy,
-                            };
+                    // Un coin n'est utilisable que si le rond est trouvé sur le scan ET
+                    // sur le template ; sinon il compte comme manquant (avant, un rond
+                    // absent du template laissait une paire (0,0) ↔ (0,0) dans le calcul).
+                    let tc = template_circles.and_then(|t| t[i].as_ref());
+                    match (c.as_ref(), tc) {
+                        (Some(c), Some(tc)) => {
+                            src_points[i] = Point { x: c.cx, y: c.cy };
                             dst_points[i] = Point { x: tc.cx, y: tc.cy };
+                        }
+                        _ => {
+                            missing_round += 1;
+                            missing_round_index = i;
                         }
                     }
                 }
