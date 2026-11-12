@@ -1,4 +1,6 @@
-use image::{GenericImage, GrayImage, Rgba, RgbaImage};
+use image::{GenericImage, GrayImage, Luma, Rgb, RgbImage, Rgba, RgbaImage};
+use std::io::Write;
+use std::path::PathBuf;
 use image::{DynamicImage,  GenericImageView};
 
 #[derive(Clone, Copy, Debug)]
@@ -294,20 +296,123 @@ pub fn validate_rms(circle: &Circle, points: &[(f32, f32)], max_ratio: f32) -> b
 pub fn detect_circles_in_four_corners_advanced(
     gray: &GrayImage,
     roi_size: u32,
-    min_radius: f32
+    min_radius: f32,
+) -> Vec<Option<Circle>> {
+    detect_circles_in_four_corners_dumped(gray, roi_size, min_radius, None)
+}
+
+/// Comme `detect_circles_in_four_corners_advanced`, en sauvegardant chaque zone
+/// de coin dans `dump` (diagnostic, voir `CornerDump`).
+pub fn detect_circles_in_four_corners_dumped(
+    gray: &GrayImage,
+    roi_size: u32,
+    min_radius: f32,
+    dump: Option<&CornerDump>,
 ) -> Vec<Option<Circle>> {
     let w = gray.width();
     let h = gray.height();
-    vec![
-        // Coin haut-gauche
-        detect_circle_roi_advanced(gray, 1, 1, roi_size - 1,min_radius),
-        // Coin haut-droit
-        detect_circle_roi_advanced(gray, w - roi_size, 0, roi_size,min_radius),
-        // Coin bas-gauche
-        detect_circle_roi_advanced(gray, 1, h - roi_size, roi_size - 1,min_radius),
-        // Coin bas-droit
-        detect_circle_roi_advanced(gray, w - roi_size, h - roi_size, roi_size,min_radius),
-    ]
+    let corners = [
+        ("HG", 1, 1, roi_size - 1),
+        ("HD", w - roi_size, 0, roi_size),
+        ("BG", 1, h - roi_size, roi_size - 1),
+        ("BD", w - roi_size, h - roi_size, roi_size),
+    ];
+    corners
+        .iter()
+        .map(|&(tag, x0, y0, size)| {
+            detect_circle_roi_dumped(gray, x0, y0, size, min_radius, dump.map(|d| (d, tag)))
+        })
+        .collect()
+}
+
+/// Sauvegarde de diagnostic des zones de coin : pour chaque coin,
+/// `{prefix}_{coin}_1_zone.png` (zone brute), `{prefix}_{coin}_2_binaire.png`
+/// (ce que voit l'algorithme après seuillage d'Otsu et ouverture),
+/// `{prefix}_{coin}_3_OK|KO.png` (cercle retenu en rouge) et une ligne dans
+/// `coins.csv`. Une erreur d'écriture est loggée et n'interrompt pas le job.
+pub struct CornerDump {
+    pub dir: PathBuf,
+    pub prefix: String,
+}
+
+impl CornerDump {
+    fn save(
+        &self,
+        tag: &str,
+        roi: &GrayImage,
+        bin: &[Vec<u8>],
+        otsu: u8,
+        (x0, y0): (u32, u32),
+        result: &Result<Circle, String>,
+    ) {
+        if let Err(e) = self.try_save(tag, roi, bin, otsu, (x0, y0), result) {
+            eprintln!("    ! Sauvegarde du coin {} {} impossible : {}", self.prefix, tag, e);
+        }
+    }
+
+    fn try_save(
+        &self,
+        tag: &str,
+        roi: &GrayImage,
+        bin: &[Vec<u8>],
+        otsu: u8,
+        (x0, y0): (u32, u32),
+        result: &Result<Circle, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let base = format!("{}_{}", self.prefix, tag);
+        let (w, h) = roi.dimensions();
+        roi.save(self.dir.join(format!("{base}_1_zone.png")))?;
+
+        let binary = GrayImage::from_fn(w, h, |x, y| {
+            Luma([if bin[y as usize][x as usize] == 1 { 0 } else { 255 }])
+        });
+        binary.save(self.dir.join(format!("{base}_2_binaire.png")))?;
+
+        let mut overlay = RgbImage::from_fn(w, h, |x, y| {
+            let v = roi.get_pixel(x, y)[0];
+            Rgb([v, v, v])
+        });
+        if let Ok(c) = result {
+            let (cx, cy) = (c.cx - x0 as f32, c.cy - y0 as f32);
+            let mut put = |x: f32, y: f32| {
+                if x >= 0.0 && y >= 0.0 && (x as u32) < w && (y as u32) < h {
+                    overlay.put_pixel(x as u32, y as u32, Rgb([255, 0, 0]));
+                }
+            };
+            let steps = (2.0 * std::f32::consts::PI * c.r).ceil().max(16.0) as usize * 2;
+            for i in 0..steps {
+                let a = i as f32 / steps as f32 * 2.0 * std::f32::consts::PI;
+                put(cx + c.r * a.cos(), cy + c.r * a.sin());
+            }
+            for d in -4..=4 {
+                put(cx + d as f32, cy);
+                put(cx, cy + d as f32);
+            }
+        }
+        let status = if result.is_ok() { "OK" } else { "KO" };
+        overlay.save(self.dir.join(format!("{base}_3_{status}.png")))?;
+
+        let csv = self.dir.join("coins.csv");
+        let new_file = !csv.exists();
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&csv)?;
+        if new_file {
+            writeln!(f, "image;coin;x0;y0;seuil_otsu;resultat;cx;cy;r;detail")?;
+        }
+        match result {
+            Ok(c) => writeln!(
+                f,
+                "{};{tag};{x0};{y0};{otsu};OK;{:.1};{:.1};{:.1};",
+                self.prefix, c.cx, c.cy, c.r
+            )?,
+            Err(msg) => writeln!(
+                f,
+                "{};{tag};{x0};{y0};{otsu};KO;;;;{}",
+                self.prefix,
+                msg.replace(';', ",")
+            )?,
+        }
+        Ok(())
+    }
 }
 
 fn extract_border_points(bin: &Vec<Vec<u8>>, w: usize, h: usize) -> Vec<(usize, usize)> {
@@ -334,6 +439,17 @@ fn extract_border_points(bin: &Vec<Vec<u8>>, w: usize, h: usize) -> Vec<(usize, 
 }
 
 pub fn detect_circle_roi_advanced(gray: &GrayImage, x0: u32, y0: u32, size: u32, min_radius: f32) -> Option<Circle> {
+    detect_circle_roi_dumped(gray, x0, y0, size, min_radius, None)
+}
+
+fn detect_circle_roi_dumped(
+    gray: &GrayImage,
+    x0: u32,
+    y0: u32,
+    size: u32,
+    min_radius: f32,
+    dump: Option<(&CornerDump, &str)>,
+) -> Option<Circle> {
     let roi = gray.view(x0, y0, size, size).to_image();
     // Otsu : la classe sombre regroupe les niveaux <= t
     let t = otsu_threshold(&roi);
@@ -347,10 +463,26 @@ pub fn detect_circle_roi_advanced(gray: &GrayImage, x0: u32, y0: u32, size: u32,
     }
     let bin = dilate(&erode(&bin, n, n), n, n);
 
-    // Un seul rond est ajusté : le plus grand candidat. Avant, le contour de
-    // toutes les composantes retenues (texte, case noircie, ombre de bord…)
-    // était ajusté comme un seul cercle, d'où un RMS élevé.
-    let blobs = connected_components(&bin, n, n);
+    let result = find_marker_circle(&bin, n, x0, y0, size, min_radius);
+    if let Err(msg) = &result {
+        println!("    ! {msg}");
+    }
+    if let Some((d, tag)) = dump {
+        d.save(tag, &roi, &bin, t, (x0, y0), &result);
+    }
+    result.ok()
+}
+
+/// Cherche le rond de calage dans la zone binarisée ; en cas d'échec, renvoie la cause.
+fn find_marker_circle(
+    bin: &[Vec<u8>],
+    n: usize,
+    x0: u32,
+    y0: u32,
+    size: u32,
+    min_radius: f32,
+) -> Result<Circle, String> {
+    let blobs = connected_components(bin, n, n);
     // 1. Chemin rapide : une tache isolée qui a la forme d'un rond plein.
     let candidate = blobs
         .iter()
@@ -361,7 +493,7 @@ pub fn detect_circle_roi_advanced(gray: &GrayImage, x0: u32, y0: u32, size: u32,
         let points = blob_border_points(blob, x0, y0);
         if let Some(circle) = fit_circle_taubin(&points) {
             if validate_rms(&circle, &points, MAX_RMS_RATIO) {
-                return Some(circle);
+                return Ok(circle);
             }
             last_rms = Some((circle.r, circle_rms(&circle, &points)));
         }
@@ -376,23 +508,23 @@ pub fn detect_circle_roi_advanced(gray: &GrayImage, x0: u32, y0: u32, size: u32,
     merged.sort_by_key(|b| std::cmp::Reverse(b.pixels.len()));
     if let Some(c) = merged
         .iter()
-        .filter_map(|b| fit_disk_in_merged_blob(&bin, n, b, x0, y0, min_radius))
+        .filter_map(|b| fit_disk_in_merged_blob(bin, n, b, x0, y0, min_radius))
         .find(|c| circle_inside_roi(c, x0, y0, size))
     {
-        return Some(c);
+        return Ok(c);
     }
 
-    match last_rms {
-        Some((r, rms)) => println!(
-            "    ! Avertissement : RMS trop élevé pour le cercle détecté (zone ({x0}, {y0}), rayon {r:.1}px, RMS {rms:.2}px)"
+    Err(match last_rms {
+        Some((r, rms)) => format!(
+            "Avertissement : RMS trop élevé pour le cercle détecté (zone ({x0}, {y0}), rayon {r:.1}px, RMS {rms:.2}px)"
         ),
-        None => println!(
-            "    ! Aucun rond plein entier dans la zone ({x0}, {y0}, {size}px) : {}",
+        None => format!(
+            "Aucun rond plein entier dans la zone ({x0}, {y0}, {size}px) : {}",
             describe_rejection(&blobs, n, x0, y0, min_radius)
         ),
-    }
-    None
+    })
 }
+
 
 pub fn validate_radial_gradient(gray: &GrayImage, circle: &Circle, points: &[(f32, f32)]) -> bool {
     let (w, h) = gray.dimensions();
@@ -1116,5 +1248,25 @@ mod tests {
                 assert!((c.cx - cx).abs() < 1.5 && (c.cy - cy).abs() < 1.5, "seed {seed} : {c:?}");
             }
         }
+    }
+
+    #[test]
+    fn sauvegarde_des_coins() {
+        let dir = std::env::temp_dir().join(format!("corners_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = page(1400, 2000, &[&disk(1330.0, 1925.0, 22.0)]);
+        let dump = CornerDump { dir: dir.clone(), prefix: "scan_p1".to_string() };
+        let found = detect_circles_in_four_corners_dumped(&img, 300, 10.0, Some(&dump));
+        assert!(found[3].is_some());
+        for tag in ["HG", "HD", "BG", "BD"] {
+            assert!(dir.join(format!("scan_p1_{tag}_1_zone.png")).exists());
+            assert!(dir.join(format!("scan_p1_{tag}_2_binaire.png")).exists());
+        }
+        assert!(dir.join("scan_p1_BD_3_OK.png").exists());
+        assert!(dir.join("scan_p1_HG_3_KO.png").exists());
+        let csv = std::fs::read_to_string(dir.join("coins.csv")).unwrap();
+        assert_eq!(csv.lines().count(), 5, "{csv}");
+        assert!(csv.contains("scan_p1;BD;1100;1700;"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

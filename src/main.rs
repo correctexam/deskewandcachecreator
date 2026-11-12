@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use urlencoding::encode;
 mod akazeai;
 mod s3fs;
@@ -71,6 +71,13 @@ struct Args {
     /// Debug
     #[arg(long, short, action, default_value_t = false)]
     debug: bool, //allow debug
+
+    /// Sauvegarde chaque zone de coin (brute, binarisée, résultat) et coins.csv
+    /// dans <DIR>/exam_<id>/ pour diagnostiquer la détection des ronds (algo 1).
+    /// Aussi activable par la variable PDF_TO_WEBP_DUMP_CORNERS ; avec --debug,
+    /// défaut : <répertoire temporaire>/pdf_to_webp_corners.
+    #[arg(long, value_name = "DIR")]
+    dump_corners: Option<PathBuf>,
 
     #[arg(long, action, default_value_t = false)]
     mq: bool, //allow debug
@@ -154,6 +161,11 @@ pub type TemplateImageMap = HashMap<u32, DynamicImage>;
 // async fn main() -> Result<()> {
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = <Args as clap::Parser>::parse();
+    let dump_corners: Option<PathBuf> = args
+        .dump_corners
+        .clone()
+        .or_else(|| std::env::var_os("PDF_TO_WEBP_DUMP_CORNERS").map(PathBuf::from))
+        .or_else(|| args.debug.then(|| std::env::temp_dir().join("pdf_to_webp_corners")));
     if args.algo > 2 {
         println!("\n❌ Algo d'alignement invalide !");
         return Err("Algo d'alignement invalide".into());
@@ -239,6 +251,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     &channel,
                     &delivery.data,
                     args.debug,
+                    dump_corners.as_deref(),
                     args.server_url.as_str(),
                     args.bucket_name.as_str(),
                     args.minio_login.as_str(),
@@ -272,6 +285,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             args.min_radius,
             align_algo,
             args.debug,
+            dump_corners.as_deref(),
             args.server_url.as_str(),
             args.bucket_name.as_str(),
             &args.minio_login.as_str(),
@@ -309,6 +323,7 @@ async fn process_exam(
     min_radius: f32,
     align_algo: AlignAlgo,
     debug: bool,
+    dump_corners: Option<&Path>,
     server_url: &str,
     bucket_name: &str,
     login: &str,
@@ -334,6 +349,27 @@ async fn process_exam(
     }
 
     let conn = create_connection(exam_id)?;
+    let corner_dump_dir = match dump_corners {
+        Some(root) => {
+            let dir = root.join(format!("exam_{}", exam_id));
+            match fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    println!("    Zones de coin sauvegardées dans {}", dir.display());
+                    Some(dir)
+                }
+                Err(e) => {
+                    eprintln!("    ! Répertoire {} inutilisable : {}", dir.display(), e);
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let corner_dump = |prefix: String| {
+        corner_dump_dir
+            .as_ref()
+            .map(|dir| CornerDump { dir: dir.clone(), prefix })
+    };
     //        pdf_path: &Path,
     let mut template_circle_map: CircleMap = HashMap::new();
     //    let mut circles_map: CircleMap = HashMap::new();
@@ -421,7 +457,12 @@ async fn process_exam(
             .to_luma8();
 
         if AlignAlgo::CircleAlign == align_algo {
-            let tcircles = detect_circles_in_four_corners_advanced(&tgray, corner_square_size,min_radius);
+            let tcircles = detect_circles_in_four_corners_dumped(
+                &tgray,
+                corner_square_size,
+                min_radius,
+                corner_dump(format!("template_p{}", page_num)).as_ref(),
+            );
             template_circle_map.insert(page_num as u32, tcircles.clone());
         }
         // Dessin des cercles en bleu
@@ -530,7 +571,12 @@ async fn process_exam(
                 }
             } else if AlignAlgo::CircleAlign == align_algo {
                 let gray = img.to_luma8();
-                let circles = detect_circles_in_four_corners_advanced(&gray, corner_square_size,min_radius);
+                let circles = detect_circles_in_four_corners_dumped(
+                    &gray,
+                    corner_square_size,
+                    min_radius,
+                    corner_dump(format!("scan_p{}", page_num)).as_ref(),
+                );
                 // Dessin des cercles en bleu
                 if debug {
                     let file_stem = pdf_template_path
@@ -752,6 +798,7 @@ async fn process_message(
     channel: &Channel,
     data: &[u8],
     debug: bool,
+    dump_corners: Option<&Path>,
     server_url: &str,
     bucket_name: &str,
     login: &str,
@@ -790,6 +837,7 @@ async fn process_message(
             _ => AlignAlgo::NoAlign,
         },
         debug,
+        dump_corners,
         server_url,
         bucket_name,
         login,
