@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::io::Cursor;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use urlencoding::encode;
 mod akazeai;
@@ -297,6 +298,58 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+/// Rend la page à `height` pixels de haut en respectant sa rotation (/Rotate).
+///
+/// `PdfiumRenderConfig::with_height` (crate pdfium 0.9.5) calcule l'échelle sur la
+/// hauteur de la CropBox *non tournée*, alors que PDFium dessine la page tournée :
+/// une page de scanner stockée en paysage avec /Rotate 90 sortait 1,41 fois trop
+/// grande, coupée en bas, dans une image de 2828 × 2000 au lieu de 1414 × 2000.
+/// `page.width()` / `page.height()` donnent la taille affichée, rotation comprise.
+fn render_page_at_height(page: &PdfiumPage, height: i32) -> PdfiumResult<PdfiumBitmap> {
+    let scale = height as f32 / page.height();
+    let width = (page.width() * scale).round() as i32;
+    page.render(
+        &PdfiumRenderConfig::new()
+            .with_size(width, height)
+            .with_scale(scale),
+    )
+}
+
+/// Diagnostic (`--dump-corners`) : sauvegarde la page rendue complète et ajoute une
+/// ligne à `pages.csv` (rotation, boîtes PDF, taille rendue). N'interrompt jamais le job.
+fn dump_rendered_page(dir: Option<&PathBuf>, prefix: &str, page: &PdfiumPage, img: &DynamicImage) {
+    let Some(dir) = dir else { return };
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        img.save(dir.join(format!("{prefix}_page.png")))?;
+        let boxes = page.boundaries();
+        let fmt = |r: PdfiumResult<PdfiumRect>| match r {
+            Ok(r) => format!("{:.1} {:.1} {:.1} {:.1}", r.left, r.bottom, r.right, r.top),
+            Err(_) => String::new(),
+        };
+        let csv = dir.join("pages.csv");
+        let new_file = !csv.exists();
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(&csv)?;
+        if new_file {
+            writeln!(f, "image;rotation_deg;vue_pt;mediabox;cropbox;rendu_px")?;
+        }
+        writeln!(
+            f,
+            "{prefix};{};{:.1}x{:.1};{};{};{}x{}",
+            page.rotation() * 90,
+            page.width(),
+            page.height(),
+            fmt(boxes.media()),
+            fmt(boxes.crop()),
+            img.width(),
+            img.height()
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        eprintln!("    ! Sauvegarde de la page {} impossible : {}", prefix, e);
+    }
+}
+
 fn page_mod(n: usize, m: usize) -> Option<usize> {
     if m == 0 {
         None
@@ -419,7 +472,6 @@ async fn process_exam(
     let document_scan = PdfiumDocument::new_from_reader(cursorscan, None).unwrap();
 
     //    let document_scan = PdfiumDocument::new_from_path(pdf_scan_path, None).unwrap();
-    let config = PdfiumRenderConfig::new().with_height(heightresolution);
 
     // 2. Charger le document PDF
     //    let document = pdfium.load_pdf_from_file(pdf_path, None)?;
@@ -430,7 +482,8 @@ async fn process_exam(
 
     for (index_template, template_page) in document_template.pages().enumerate() {
         let page_num = index_template + 1;
-        let bitmap_template = template_page.unwrap().render(&config).unwrap();
+        let template_page = template_page.unwrap();
+        let bitmap_template = render_page_at_height(&template_page, heightresolution).unwrap();
         let template_img = match bitmap_template.as_rgb8_image() {
             Ok(template_img) => template_img,
             Err(_) => {
@@ -441,6 +494,12 @@ async fn process_exam(
                 continue;
             }
         };
+        dump_rendered_page(
+            corner_dump_dir.as_ref(),
+            &format!("template_p{}", page_num),
+            &template_page,
+            &template_img,
+        );
 
         template_image_map.insert(page_num as u32, template_img);
         let _ = save_image_to_db_webp(
@@ -507,7 +566,8 @@ async fn process_exam(
                 page_num, page_count_scan
             );
 
-            let bitmap = page.unwrap().render(&config).unwrap();
+            let page = page.unwrap();
+            let bitmap = render_page_at_height(&page, heightresolution).unwrap();
             // --- Remplacement ici : obtenir l'image en owned DynamicImage (mutable)
             let mut img = match bitmap.as_rgb8_image() {
                 Ok(img) => img,
@@ -519,6 +579,7 @@ async fn process_exam(
                     continue;
                 }
             };
+            dump_rendered_page(corner_dump_dir.as_ref(), &format!("scan_p{}", page_num), &page, &img);
 
             let _ = save_image_to_db_webp(&conn, &img, &(page_num as i32), ImageState::NonAlign);
             println!("    -> Sauvegardé : {}", page_num);
@@ -868,4 +929,59 @@ async fn process_message(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    /// PDF d'une page stockée en paysage (842 × 595 pt) avec /Rotate 90, comme le
+    /// produisent de nombreux scanners : elle s'affiche en portrait (595 × 842 pt).
+    /// Deux carrés noirs : coin bas-gauche stocké (→ haut-gauche affiché) et coin
+    /// haut-droit stocké (→ bas-droit affiché).
+    fn rotated_scan_pdf() -> Vec<u8> {
+        let content = "0 g 0 0 40 40 re f 802 555 40 40 re f";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 842 595] /Rotate 90 /Contents 4 0 R >>"
+                .to_string(),
+            format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, obj) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, obj).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+        for o in offsets {
+            pdf.extend_from_slice(format!("{:010} 00000 n \n", o).as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", objects.len() + 1, xref)
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn page_tournee_rendue_a_la_hauteur_demandee() {
+        let doc = PdfiumDocument::new_from_reader(Cursor::new(rotated_scan_pdf()), None).unwrap();
+        let page = doc.page(0).unwrap();
+        assert_eq!(page.rotation(), 1);
+
+        let img = render_page_at_height(&page, 2000)
+            .unwrap()
+            .as_rgb8_image()
+            .unwrap()
+            .to_luma8();
+        // 595 × 842 pt affichés → 1413 × 2000 px (et non 2830 × 2000)
+        assert_eq!(img.dimensions(), (1413, 2000));
+        // les deux carrés sont aux coins opposés de l'image, à la bonne taille (40 pt ≈ 95 px)
+        assert!(img.get_pixel(10, 10)[0] < 64, "carré haut-gauche absent");
+        assert!(img.get_pixel(1403, 1990)[0] < 64, "carré bas-droit absent");
+        assert!(img.get_pixel(110, 110)[0] > 192, "carré haut-gauche trop grand");
+    }
 }
