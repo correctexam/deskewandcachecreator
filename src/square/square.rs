@@ -130,6 +130,140 @@ fn blob_border_points(blob: &Blob, x0: u32, y0: u32) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// Transformée de distance chanfrein 3-4 (en pixels) : distance de chaque pixel
+/// de `mask` au fond le plus proche ; l'extérieur de la zone compte comme fond.
+fn distance_transform(mask: &[Vec<bool>], w: usize, h: usize) -> Vec<Vec<f32>> {
+    const INF: u32 = u32::MAX / 4;
+    let mut d = vec![vec![0u32; w]; h];
+    for y in 0..h {
+        for x in 0..w {
+            if !mask[y][x] {
+                continue;
+            }
+            let mut v = INF;
+            v = v.min(if x > 0 { d[y][x - 1] + 3 } else { 3 });
+            v = v.min(if y > 0 { d[y - 1][x] + 3 } else { 3 });
+            v = v.min(if x > 0 && y > 0 { d[y - 1][x - 1] + 4 } else { 4 });
+            v = v.min(if x + 1 < w && y > 0 { d[y - 1][x + 1] + 4 } else { 4 });
+            d[y][x] = v;
+        }
+    }
+    for y in (0..h).rev() {
+        for x in (0..w).rev() {
+            if !mask[y][x] {
+                continue;
+            }
+            let mut v = d[y][x];
+            v = v.min(if x + 1 < w { d[y][x + 1] + 3 } else { 3 });
+            v = v.min(if y + 1 < h { d[y + 1][x] + 3 } else { 3 });
+            v = v.min(if x + 1 < w && y + 1 < h { d[y + 1][x + 1] + 4 } else { 4 });
+            v = v.min(if x > 0 && y + 1 < h { d[y + 1][x - 1] + 4 } else { 4 });
+            d[y][x] = v;
+        }
+    }
+    d.into_iter()
+        .map(|row| row.into_iter().map(|v| v as f32 / 3.0).collect())
+        .collect()
+}
+
+/// Nombre minimal de secteurs de 10° couverts par l'arc libre du rond (240°) :
+/// un carré plein n'offre qu'environ 4 × 32° de contour à distance constante du centre.
+const MIN_FREE_ARC_SECTORS: usize = 24;
+
+/// Repli pour un rond collé à une autre forme (trait de cadre, texte, ombre de
+/// bord du scanner) : le centre du rond est le pixel le plus éloigné du fond ;
+/// on ajuste le cercle sur la partie libre de son contour, celle qui se trouve
+/// à la bonne distance de ce centre.
+fn fit_disk_in_merged_blob(
+    bin: &[Vec<u8>],
+    n: usize,
+    blob: &Blob,
+    x0: u32,
+    y0: u32,
+    min_radius: f32,
+) -> Option<Circle> {
+    let mut mask = vec![vec![false; n]; n];
+    for &(x, y) in &blob.pixels {
+        mask[y][x] = bin[y][x] == 1;
+    }
+    let dt = distance_transform(&mask, n, n);
+    let (&(px, py), r0) = blob
+        .pixels
+        .iter()
+        .map(|p| (p, dt[p.1][p.0]))
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    if r0 <= min_radius {
+        return None;
+    }
+    let border = blob_border_points(blob, 0, 0);
+    let select = |cx: f32, cy: f32, r: f32, tol: f32| -> Vec<(f32, f32)> {
+        border
+            .iter()
+            .copied()
+            .filter(|(x, y)| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() - r <= tol)
+            .filter(|(x, y)| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() - r >= -tol)
+            .collect()
+    };
+    let tol = (0.15 * r0).max(2.0);
+    let mut pts = select(px as f32, py as f32, r0, tol);
+    let mut circle = fit_circle_taubin(&pts)?;
+    // Second passage, resserré autour du premier cercle
+    pts = select(circle.cx, circle.cy, circle.r, 1.5);
+    circle = fit_circle_taubin(&pts)?;
+
+    let mut sectors = [false; 36];
+    for (x, y) in &pts {
+        let a = (y - circle.cy).atan2(x - circle.cx);
+        let k = (((a + std::f32::consts::PI) / (2.0 * std::f32::consts::PI)) * 36.0) as usize;
+        sectors[k.min(35)] = true;
+    }
+    if sectors.iter().filter(|s| **s).count() < MIN_FREE_ARC_SECTORS {
+        return None;
+    }
+    if !validate_rms(&circle, &pts, MAX_RMS_RATIO) {
+        return None;
+    }
+    Some(Circle { cx: circle.cx + x0 as f32, cy: circle.cy + y0 as f32, r: circle.r })
+}
+
+/// Un rond dont le cercle ajusté sort de la zone est tronqué : son centre est faux.
+fn circle_inside_roi(c: &Circle, x0: u32, y0: u32, size: u32) -> bool {
+    let (lx, ly) = (c.cx - x0 as f32, c.cy - y0 as f32);
+    lx - c.r > 1.0 && ly - c.r > 1.0 && lx + c.r < size as f32 - 2.0 && ly + c.r < size as f32 - 2.0
+}
+
+/// Explique pourquoi la plus grande tache de la zone n'a pas été retenue.
+fn describe_rejection(blobs: &[Blob], n: usize, x0: u32, y0: u32, min_radius: f32) -> String {
+    let Some(b) = blobs.iter().max_by_key(|b| b.pixels.len()) else {
+        return "aucune tache sombre (zone vide ou seuil inadapté)".to_string();
+    };
+    let (bw, bh) = (b.width() as f32, b.height() as f32);
+    let r = (bw + bh) / 4.0;
+    let fill = b.pixels.len() as f32 / (std::f32::consts::PI * r * r);
+    let mut why = Vec::new();
+    if b.minx <= 1 || b.miny <= 1 || b.maxx + 2 >= n || b.maxy + 2 >= n {
+        why.push("touche le bord de la zone (rond coupé ou ombre du scanner : augmenter corner_square_size ?)");
+    }
+    if r <= min_radius {
+        why.push("plus petite que min_radius");
+    }
+    if fill < MIN_DISK_FILL_RATIO {
+        why.push("peu remplie (rond creux ou forme non circulaire ?)");
+    }
+    if why.is_empty() {
+        why.push("forme non circulaire");
+    }
+    format!(
+        "plus grande tache {}x{} px en ({}, {}), remplissage {:.2} : {}",
+        b.width(),
+        b.height(),
+        b.minx as u32 + x0,
+        b.miny as u32 + y0,
+        fill,
+        why.join(", ")
+    )
+}
+
 /// Conservé pour compatibilité : ne garde que les composantes qui ressemblent
 /// à un rond plein entièrement contenu dans la zone.
 pub fn filter_filled_circles(bin: &Vec<Vec<u8>>, w: usize, h: usize, min_radius: f32) -> Vec<Vec<u8>> {
@@ -217,27 +351,47 @@ pub fn detect_circle_roi_advanced(gray: &GrayImage, x0: u32, y0: u32, size: u32,
     // toutes les composantes retenues (texte, case noircie, ombre de bord…)
     // était ajusté comme un seul cercle, d'où un RMS élevé.
     let blobs = connected_components(&bin, n, n);
-    let Some(blob) = blobs
+    // 1. Chemin rapide : une tache isolée qui a la forme d'un rond plein.
+    let candidate = blobs
         .iter()
         .filter(|b| is_disk_candidate(b, n, n, min_radius))
-        .max_by_key(|b| b.pixels.len())
-    else {
-        println!("    ! Aucun rond plein entier dans la zone ({x0}, {y0}, {size}px)");
-        return None;
-    };
-
-    let points = blob_border_points(blob, x0, y0);
-    let circle = fit_circle_taubin(&points)?;
-    let rms = circle_rms(&circle, &points);
-    if !validate_rms(&circle, &points, MAX_RMS_RATIO) {
-        println!(
-            "    ! Avertissement : RMS trop élevé pour le cercle détecté (zone ({x0}, {y0}), rayon {:.1}px, RMS {:.2}px)",
-            circle.r, rms
-        );
-        return None;
+        .max_by_key(|b| b.pixels.len());
+    let mut last_rms: Option<(f32, f32)> = None;
+    if let Some(blob) = candidate {
+        let points = blob_border_points(blob, x0, y0);
+        if let Some(circle) = fit_circle_taubin(&points) {
+            if validate_rms(&circle, &points, MAX_RMS_RATIO) {
+                return Some(circle);
+            }
+            last_rms = Some((circle.r, circle_rms(&circle, &points)));
+        }
     }
 
-    Some(circle)
+    // 2. Repli : rond collé à une autre forme (trait, texte, ombre du scanner) ou
+    //    au contour irrégulier ; les points hors de l'arc du rond sont écartés.
+    let mut merged: Vec<&Blob> = blobs
+        .iter()
+        .filter(|b| b.pixels.len() as f32 > std::f32::consts::PI * min_radius * min_radius)
+        .collect();
+    merged.sort_by_key(|b| std::cmp::Reverse(b.pixels.len()));
+    if let Some(c) = merged
+        .iter()
+        .filter_map(|b| fit_disk_in_merged_blob(&bin, n, b, x0, y0, min_radius))
+        .find(|c| circle_inside_roi(c, x0, y0, size))
+    {
+        return Some(c);
+    }
+
+    match last_rms {
+        Some((r, rms)) => println!(
+            "    ! Avertissement : RMS trop élevé pour le cercle détecté (zone ({x0}, {y0}), rayon {r:.1}px, RMS {rms:.2}px)"
+        ),
+        None => println!(
+            "    ! Aucun rond plein entier dans la zone ({x0}, {y0}, {size}px) : {}",
+            describe_rejection(&blobs, n, x0, y0, min_radius)
+        ),
+    }
+    None
 }
 
 pub fn validate_radial_gradient(gray: &GrayImage, circle: &Circle, points: &[(f32, f32)]) -> bool {
@@ -912,5 +1066,55 @@ mod tests {
         let f = detect_circles_in_four_corners_advanced(&img, 300, 10.0);
         assert!(f[0].is_none() && f[1].is_none() && f[2].is_none());
         assert_close(f[3].as_ref().unwrap(), 1330.0, 1925.0);
+    }
+
+    #[test]
+    fn rond_colle_a_un_trait_de_cadre() {
+        let img = page(300, 300, &[&disk(120.0, 120.0, 25.0), &rect(140.0, 118.0, 300.0, 121.0)]);
+        assert_close(&detect_circle_roi_advanced(&img, 0, 0, 300, 10.0).expect("rond"), 120.0, 120.0);
+    }
+    #[test]
+    fn rond_colle_a_du_texte() {
+        let img = page(300, 300, &[&disk(120.0, 120.0, 25.0), &rect(143.0, 110.0, 149.0, 135.0), &rect(149.0, 110.0, 170.0, 114.0)]);
+        assert_close(&detect_circle_roi_advanced(&img, 0, 0, 300, 10.0).expect("rond"), 120.0, 120.0);
+    }
+    #[test]
+    fn rond_fondu_dans_l_ombre_du_bord() {
+        let img = page(300, 300, &[&disk(40.0, 150.0, 25.0), &rect(0.0, 0.0, 20.0, 300.0)]);
+        assert_close(&detect_circle_roi_advanced(&img, 0, 0, 300, 10.0).expect("rond"), 40.0, 150.0);
+    }
+    #[test]
+    fn pas_de_faux_rond_dans_un_carre_ou_une_bande() {
+        let img = page(300, 300, &[&rect(100.0, 100.0, 180.0, 180.0), &rect(0.0, 0.0, 30.0, 300.0)]);
+        assert!(detect_circle_roi_advanced(&img, 0, 0, 300, 10.0).is_none());
+    }
+    #[test]
+    fn anneau_et_petit_rond_rejetes() {
+        let anneau = |x: f32, y: f32| { let d = ((x - 150.0).powi(2) + (y - 150.0).powi(2)).sqrt(); d <= 25.0 && d >= 20.0 };
+        assert!(detect_circle_roi_advanced(&page(300, 300, &[&anneau]), 0, 0, 300, 10.0).is_none());
+        assert!(detect_circle_roi_advanced(&page(300, 300, &[&disk(150.0, 150.0, 9.0)]), 0, 0, 300, 10.0).is_none());
+    }
+
+    #[test]
+    fn ronds_bruites_flous_et_ovales() {
+        // niveaux de gris bruités (±30), bords flous (~3 px), ovale de 4 %, avec ou sans ombre / trait collé
+        let soft = |d: f32| (0.5 - d / 3.0).clamp(0.0, 1.0);
+        for seed in 0..20u64 {
+            for (band, line) in [(false, false), (true, false), (false, true)] {
+                let (cx, cy) = (60.0 + seed as f32, 150.0 - seed as f32 * 0.7);
+                let mut s = seed;
+                let img = GrayImage::from_fn(300, 300, |x, y| {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let noise = ((s >> 33) % 61) as f32 - 30.0;
+                    let (xf, yf) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let mut ink = soft((((xf - cx) / 1.04).powi(2) + (yf - cy).powi(2)).sqrt() - 24.0);
+                    if band { ink = ink.max(soft(xf - 22.0)); }
+                    if line && xf > cx { ink = ink.max(soft((yf - cy).abs() - 1.5)); }
+                    Luma([(225.0 - 190.0 * ink + noise).clamp(0.0, 255.0) as u8])
+                });
+                let c = detect_circle_roi_advanced(&img, 0, 0, 300, 10.0).expect("rond");
+                assert!((c.cx - cx).abs() < 1.5 && (c.cy - cy).abs() < 1.5, "seed {seed} : {c:?}");
+            }
+        }
     }
 }
