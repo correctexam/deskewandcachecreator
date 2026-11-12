@@ -15,7 +15,8 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::io::Cursor;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use urlencoding::encode;
 mod akazeai;
 mod s3fs;
@@ -71,6 +72,13 @@ struct Args {
     /// Debug
     #[arg(long, short, action, default_value_t = false)]
     debug: bool, //allow debug
+
+    /// Sauvegarde chaque zone de coin (brute, binarisée, résultat) et coins.csv
+    /// dans <DIR>/exam_<id>/ pour diagnostiquer la détection des ronds (algo 1).
+    /// Aussi activable par la variable PDF_TO_WEBP_DUMP_CORNERS ; avec --debug,
+    /// défaut : <répertoire temporaire>/pdf_to_webp_corners.
+    #[arg(long, value_name = "DIR")]
+    dump_corners: Option<PathBuf>,
 
     #[arg(long, action, default_value_t = false)]
     mq: bool, //allow debug
@@ -154,6 +162,11 @@ pub type TemplateImageMap = HashMap<u32, DynamicImage>;
 // async fn main() -> Result<()> {
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = <Args as clap::Parser>::parse();
+    let dump_corners: Option<PathBuf> = args
+        .dump_corners
+        .clone()
+        .or_else(|| std::env::var_os("PDF_TO_WEBP_DUMP_CORNERS").map(PathBuf::from))
+        .or_else(|| args.debug.then(|| std::env::temp_dir().join("pdf_to_webp_corners")));
     if args.algo > 2 {
         println!("\n❌ Algo d'alignement invalide !");
         return Err("Algo d'alignement invalide".into());
@@ -239,6 +252,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     &channel,
                     &delivery.data,
                     args.debug,
+                    dump_corners.as_deref(),
                     args.server_url.as_str(),
                     args.bucket_name.as_str(),
                     args.minio_login.as_str(),
@@ -272,6 +286,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             args.min_radius,
             align_algo,
             args.debug,
+            dump_corners.as_deref(),
             args.server_url.as_str(),
             args.bucket_name.as_str(),
             &args.minio_login.as_str(),
@@ -283,6 +298,58 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+/// Rend la page à `height` pixels de haut en respectant sa rotation (/Rotate).
+///
+/// `PdfiumRenderConfig::with_height` (crate pdfium 0.9.5) calcule l'échelle sur la
+/// hauteur de la CropBox *non tournée*, alors que PDFium dessine la page tournée :
+/// une page de scanner stockée en paysage avec /Rotate 90 sortait 1,41 fois trop
+/// grande, coupée en bas, dans une image de 2828 × 2000 au lieu de 1414 × 2000.
+/// `page.width()` / `page.height()` donnent la taille affichée, rotation comprise.
+fn render_page_at_height(page: &PdfiumPage, height: i32) -> PdfiumResult<PdfiumBitmap> {
+    let scale = height as f32 / page.height();
+    let width = (page.width() * scale).round() as i32;
+    page.render(
+        &PdfiumRenderConfig::new()
+            .with_size(width, height)
+            .with_scale(scale),
+    )
+}
+
+/// Diagnostic (`--dump-corners`) : sauvegarde la page rendue complète et ajoute une
+/// ligne à `pages.csv` (rotation, boîtes PDF, taille rendue). N'interrompt jamais le job.
+fn dump_rendered_page(dir: Option<&PathBuf>, prefix: &str, page: &PdfiumPage, img: &DynamicImage) {
+    let Some(dir) = dir else { return };
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        img.save(dir.join(format!("{prefix}_page.png")))?;
+        let boxes = page.boundaries();
+        let fmt = |r: PdfiumResult<PdfiumRect>| match r {
+            Ok(r) => format!("{:.1} {:.1} {:.1} {:.1}", r.left, r.bottom, r.right, r.top),
+            Err(_) => String::new(),
+        };
+        let csv = dir.join("pages.csv");
+        let new_file = !csv.exists();
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(&csv)?;
+        if new_file {
+            writeln!(f, "image;rotation_deg;vue_pt;mediabox;cropbox;rendu_px")?;
+        }
+        writeln!(
+            f,
+            "{prefix};{};{:.1}x{:.1};{};{};{}x{}",
+            page.rotation() * 90,
+            page.width(),
+            page.height(),
+            fmt(boxes.media()),
+            fmt(boxes.crop()),
+            img.width(),
+            img.height()
+        )?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        eprintln!("    ! Sauvegarde de la page {} impossible : {}", prefix, e);
+    }
+}
+
 fn page_mod(n: usize, m: usize) -> Option<usize> {
     if m == 0 {
         None
@@ -309,6 +376,7 @@ async fn process_exam(
     min_radius: f32,
     align_algo: AlignAlgo,
     debug: bool,
+    dump_corners: Option<&Path>,
     server_url: &str,
     bucket_name: &str,
     login: &str,
@@ -334,6 +402,27 @@ async fn process_exam(
     }
 
     let conn = create_connection(exam_id)?;
+    let corner_dump_dir = match dump_corners {
+        Some(root) => {
+            let dir = root.join(format!("exam_{}", exam_id));
+            match fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    println!("    Zones de coin sauvegardées dans {}", dir.display());
+                    Some(dir)
+                }
+                Err(e) => {
+                    eprintln!("    ! Répertoire {} inutilisable : {}", dir.display(), e);
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let corner_dump = |prefix: String| {
+        corner_dump_dir
+            .as_ref()
+            .map(|dir| CornerDump { dir: dir.clone(), prefix })
+    };
     //        pdf_path: &Path,
     let mut template_circle_map: CircleMap = HashMap::new();
     //    let mut circles_map: CircleMap = HashMap::new();
@@ -383,7 +472,6 @@ async fn process_exam(
     let document_scan = PdfiumDocument::new_from_reader(cursorscan, None).unwrap();
 
     //    let document_scan = PdfiumDocument::new_from_path(pdf_scan_path, None).unwrap();
-    let config = PdfiumRenderConfig::new().with_height(heightresolution);
 
     // 2. Charger le document PDF
     //    let document = pdfium.load_pdf_from_file(pdf_path, None)?;
@@ -394,7 +482,8 @@ async fn process_exam(
 
     for (index_template, template_page) in document_template.pages().enumerate() {
         let page_num = index_template + 1;
-        let bitmap_template = template_page.unwrap().render(&config).unwrap();
+        let template_page = template_page.unwrap();
+        let bitmap_template = render_page_at_height(&template_page, heightresolution).unwrap();
         let template_img = match bitmap_template.as_rgb8_image() {
             Ok(template_img) => template_img,
             Err(_) => {
@@ -405,6 +494,12 @@ async fn process_exam(
                 continue;
             }
         };
+        dump_rendered_page(
+            corner_dump_dir.as_ref(),
+            &format!("template_p{}", page_num),
+            &template_page,
+            &template_img,
+        );
 
         template_image_map.insert(page_num as u32, template_img);
         let _ = save_image_to_db_webp(
@@ -421,7 +516,12 @@ async fn process_exam(
             .to_luma8();
 
         if AlignAlgo::CircleAlign == align_algo {
-            let tcircles = detect_circles_in_four_corners_advanced(&tgray, corner_square_size,min_radius);
+            let tcircles = detect_circles_in_four_corners_dumped(
+                &tgray,
+                corner_square_size,
+                min_radius,
+                corner_dump(format!("template_p{}", page_num)).as_ref(),
+            );
             template_circle_map.insert(page_num as u32, tcircles.clone());
         }
         // Dessin des cercles en bleu
@@ -466,7 +566,8 @@ async fn process_exam(
                 page_num, page_count_scan
             );
 
-            let bitmap = page.unwrap().render(&config).unwrap();
+            let page = page.unwrap();
+            let bitmap = render_page_at_height(&page, heightresolution).unwrap();
             // --- Remplacement ici : obtenir l'image en owned DynamicImage (mutable)
             let mut img = match bitmap.as_rgb8_image() {
                 Ok(img) => img,
@@ -478,6 +579,7 @@ async fn process_exam(
                     continue;
                 }
             };
+            dump_rendered_page(corner_dump_dir.as_ref(), &format!("scan_p{}", page_num), &page, &img);
 
             let _ = save_image_to_db_webp(&conn, &img, &(page_num as i32), ImageState::NonAlign);
             println!("    -> Sauvegardé : {}", page_num);
@@ -530,7 +632,12 @@ async fn process_exam(
                 }
             } else if AlignAlgo::CircleAlign == align_algo {
                 let gray = img.to_luma8();
-                let circles = detect_circles_in_four_corners_advanced(&gray, corner_square_size,min_radius);
+                let circles = detect_circles_in_four_corners_dumped(
+                    &gray,
+                    corner_square_size,
+                    min_radius,
+                    corner_dump(format!("scan_p{}", page_num)).as_ref(),
+                );
                 // Dessin des cercles en bleu
                 if debug {
                     let file_stem = pdf_template_path
@@ -553,21 +660,21 @@ async fn process_exam(
                 let mut dst_points = [Point { x: 0.0, y: 0.0 }; 4];
                 let mut missing_round = 0;
                 let mut missing_round_index = 0;
+                let pagemod = page_mod(page_num, template_circle_map.len()).unwrap() as u32;
+                let template_circles = template_circle_map.get(&pagemod);
                 for (i, c) in circles.iter().enumerate() {
-                    let pagemod = &(page_mod(page_num, template_circle_map.len()).unwrap() as u32);
-                    if c.is_none() {
-                        missing_round = missing_round + 1;
-                        missing_round_index = i;
-                    } else if c.is_some() && template_circle_map.get(pagemod).is_some() {
-                        let template_circles = template_circle_map.get(pagemod).unwrap();
-                        if template_circles[i].is_some() {
-                            let tc = template_circles[i].as_ref().unwrap();
-                            let c_unwrap = c.as_ref().unwrap();
-                            src_points[i] = Point {
-                                x: c_unwrap.cx,
-                                y: c_unwrap.cy,
-                            };
+                    // Un coin n'est utilisable que si le rond est trouvé sur le scan ET
+                    // sur le template ; sinon il compte comme manquant (avant, un rond
+                    // absent du template laissait une paire (0,0) ↔ (0,0) dans le calcul).
+                    let tc = template_circles.and_then(|t| t[i].as_ref());
+                    match (c.as_ref(), tc) {
+                        (Some(c), Some(tc)) => {
+                            src_points[i] = Point { x: c.cx, y: c.cy };
                             dst_points[i] = Point { x: tc.cx, y: tc.cy };
+                        }
+                        _ => {
+                            missing_round += 1;
+                            missing_round_index = i;
                         }
                     }
                 }
@@ -788,6 +895,7 @@ async fn process_message(
     channel: &Channel,
     data: &[u8],
     debug: bool,
+    dump_corners: Option<&Path>,
     server_url: &str,
     bucket_name: &str,
     login: &str,
@@ -862,6 +970,7 @@ async fn run_job(
             _ => AlignAlgo::NoAlign,
         },
         debug,
+        dump_corners,
         server_url,
         bucket_name,
         login,
@@ -885,6 +994,57 @@ async fn run_job(
 }
 
 #[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    /// PDF d'une page stockée en paysage (842 × 595 pt) avec /Rotate 90, comme le
+    /// produisent de nombreux scanners : elle s'affiche en portrait (595 × 842 pt).
+    /// Deux carrés noirs : coin bas-gauche stocké (→ haut-gauche affiché) et coin
+    /// haut-droit stocké (→ bas-droit affiché).
+    fn rotated_scan_pdf() -> Vec<u8> {
+        let content = "0 g 0 0 40 40 re f 802 555 40 40 re f";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 842 595] /Rotate 90 /Contents 4 0 R >>"
+                .to_string(),
+            format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, obj) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, obj).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+        for o in offsets {
+            pdf.extend_from_slice(format!("{:010} 00000 n \n", o).as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n", objects.len() + 1, xref)
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn page_tournee_rendue_a_la_hauteur_demandee() {
+        let doc = PdfiumDocument::new_from_reader(Cursor::new(rotated_scan_pdf()), None).unwrap();
+        let page = doc.page(0).unwrap();
+        assert_eq!(page.rotation(), 1);
+
+        let img = render_page_at_height(&page, 2000)
+            .unwrap()
+            .as_rgb8_image()
+            .unwrap()
+            .to_luma8();
+        // 595 × 842 pt affichés → 1413 × 2000 px (et non 2830 × 2000)
+        assert_eq!(img.dimensions(), (1413, 2000));
+        // les deux carrés sont aux coins opposés de l'image, à la bonne taille (40 pt ≈ 95 px)
+        assert!(img.get_pixel(10, 10)[0] < 64, "carré haut-gauche absent");
+        assert!(img.get_pixel(1403, 1990)[0] < 64, "carré bas-droit absent");
+        assert!(img.get_pixel(110, 110)[0] > 192, "carré haut-gauche trop grand");
 mod tests {
     use super::*;
 
