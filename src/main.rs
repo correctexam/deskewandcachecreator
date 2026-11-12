@@ -845,16 +845,52 @@ async fn process_exam(
         login,
         pass,
     ).await;
-       match res {
+    let _ = fs::remove_file(format!("/tmp/{}.sqlite3", exam_id));
+    match res {
         Ok(_) => println!("✅ Cache sauvegardé avec succès pour l'exam {}.", exam_id),
-        Err(e) => eprintln!("❌ Erreur lors de la sauvegarde du cache pour l'exam {}: {}", exam_id, e),
+        Err(e) => {
+            // Sans cache sur S3, le front importerait un cache périmé : le job doit échouer.
+            eprintln!("❌ Erreur lors de la sauvegarde du cache pour l'exam {}: {}", exam_id, e);
+            return Err(format!("sauvegarde du cache cache/{}.sqlite3 impossible : {}", exam_id, e).into());
+        }
     }
-    fs::remove_file(format!("/tmp/{}.sqlite3", exam_id))?;
 
     Ok(())
 }
 
-/// Logique cœur du Worker
+/// Publie un statut d'avancement sur l'exchange de sortie, avec la clé `scan.status.{exam_id}`.
+async fn publish_status(
+    channel: &Channel,
+    mq_server_ouputqueue: &String,
+    status: &ScanStatus,
+) -> Result<(), Box<dyn Error>> {
+    let routing_key = format!("scan.status.{}", status.exam_id);
+    let payload = serde_json::to_vec(status)?;
+    channel
+        .basic_publish(
+            mq_server_ouputqueue,
+            &routing_key,
+            BasicPublishOptions::default(),
+            &payload,
+            BasicProperties::default(),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Statut d'erreur envoyé au client quand un job échoue : sans lui, le front attendrait indéfiniment.
+fn error_status(exam_id: u32, error: &dyn Error) -> ScanStatus {
+    ScanStatus {
+        exam_id,
+        page: 0,
+        status: "error".to_string(),
+        progress: 0,
+        details: format!("Échec de l'alignement : {}", error),
+    }
+}
+
+/// Logique cœur du Worker : désérialise le job, l'exécute et publie toujours un statut
+/// terminal (`finished` en cas de succès, `error` en cas d'échec).
 async fn process_message(
     channel: &Channel,
     data: &[u8],
@@ -866,22 +902,58 @@ async fn process_message(
     pass: &str,
     mq_server_ouputqueue: &String,
 ) -> Result<(), Box<dyn Error>> {
-    // 1. Désérialisation
+    // 1. Désérialisation (sans exam_id valide, aucun statut ne peut être adressé au client)
     let request: ScanRequest = serde_json::from_slice(data)?;
     println!(
-        "   Détails : Scan ID {}, Pages '{}', Algo {}",
-        request.scan_id, request.pages_to_manage, request.algo
+        "   Détails : Exam ID {}, Scan ID {}, Pages '{}', Algo {}",
+        request.exam_id, request.scan_id, request.pages_to_manage, request.algo
     );
 
-    // 2. Parsing des pages
-    let pages = parse_page_selection(&request.pages_to_manage).unwrap_or_default();
-    let total = pages.len();
+    let result = run_job(
+        channel,
+        &request,
+        debug,
+        server_url,
+        bucket_name,
+        login,
+        pass,
+        mq_server_ouputqueue,
+    )
+    .await;
 
-    if total == 0 {
-        println!("   Aucune page à traiter.");
-        return Ok(());
+    if let Err(e) = &result {
+        let status = error_status(request.exam_id, e.as_ref());
+        if let Err(publish_error) = publish_status(channel, mq_server_ouputqueue, &status).await {
+            eprintln!(
+                "❌ Impossible de publier le statut d'erreur pour l'exam {} : {}",
+                request.exam_id, publish_error
+            );
+        }
     }
-        println!("  radius {}",request.min_radius);
+    result
+}
+
+/// Exécute un job d'alignement et publie le statut final `finished`.
+async fn run_job(
+    channel: &Channel,
+    request: &ScanRequest,
+    debug: bool,
+    server_url: &str,
+    bucket_name: &str,
+    login: &str,
+    pass: &str,
+    mq_server_ouputqueue: &String,
+) -> Result<(), Box<dyn Error>> {
+    // 2. Parsing des pages : une sélection vide ou invalide est une erreur du job
+    let pages = parse_page_selection(&request.pages_to_manage).unwrap_or_default();
+    if pages.is_empty() {
+        return Err(format!(
+            "aucune page à traiter (sélection '{}' vide ou invalide)",
+            request.pages_to_manage
+        )
+        .into());
+    }
+    println!("  radius {}", request.min_radius);
 
     process_exam(
         pages,
@@ -908,8 +980,7 @@ async fn process_message(
     )
     .await?;
 
-    // 5. Message final de complétion
-    let final_key = format!("scan.status.{}", request.scan_id);
+    // 3. Message final de complétion (clé de routage indexée par exam_id, comme les statuts de page)
     let final_msg = ScanStatus {
         exam_id: request.exam_id,
         page: 0,
@@ -917,16 +988,7 @@ async fn process_message(
         progress: 100,
         details: "Traitement complet terminé".to_string(),
     };
-
-    channel
-        .basic_publish(
-            mq_server_ouputqueue,
-            &final_key,
-            BasicPublishOptions::default(),
-            &serde_json::to_vec(&final_msg)?,
-            BasicProperties::default(),
-        )
-        .await?;
+    publish_status(channel, mq_server_ouputqueue, &final_msg).await?;
 
     Ok(())
 }
@@ -983,5 +1045,32 @@ mod render_tests {
         assert!(img.get_pixel(10, 10)[0] < 64, "carré haut-gauche absent");
         assert!(img.get_pixel(1403, 1990)[0] < 64, "carré bas-droit absent");
         assert!(img.get_pixel(110, 110)[0] > 192, "carré haut-gauche trop grand");
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_status_targets_the_exam_and_is_terminal() {
+        let err: Box<dyn Error> = "cache upload failed".into();
+        let status = error_status(855, err.as_ref());
+        assert_eq!(status.exam_id, 855);
+        assert_eq!(status.status, "error");
+        assert_eq!(status.page, 0);
+        assert!(status.details.contains("cache upload failed"));
+    }
+
+    #[test]
+    fn status_is_serialized_with_the_java_field_names() {
+        let status = error_status(1, Box::<dyn Error>::from("boom").as_ref());
+        let json: serde_json::Value = serde_json::to_value(&status).unwrap();
+        for field in ["exam_id", "page", "status", "progress", "details"] {
+            assert!(json.get(field).is_some(), "missing field {}", field);
+        }
+    }
+
+    #[test]
+    fn front_page_selection_format_is_accepted() {
+        // format produit par pagesToManage() côté front : « 1-3; 5 »
+        assert_eq!(parse_page_selection("1-3; 5").unwrap(), vec![1, 2, 3, 5]);
+        assert!(parse_page_selection("").unwrap().is_empty());
     }
 }
