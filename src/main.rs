@@ -913,6 +913,7 @@ async fn process_message(
         channel,
         &request,
         debug,
+        dump_corners,
         server_url,
         bucket_name,
         login,
@@ -938,6 +939,8 @@ async fn run_job(
     channel: &Channel,
     request: &ScanRequest,
     debug: bool,
+    dump_corners: Option<&Path>,
+
     server_url: &str,
     bucket_name: &str,
     login: &str,
@@ -1045,6 +1048,8 @@ mod render_tests {
         assert!(img.get_pixel(10, 10)[0] < 64, "carré haut-gauche absent");
         assert!(img.get_pixel(1403, 1990)[0] < 64, "carré bas-droit absent");
         assert!(img.get_pixel(110, 110)[0] > 192, "carré haut-gauche trop grand");
+    }
+}
 mod tests {
     use super::*;
 
