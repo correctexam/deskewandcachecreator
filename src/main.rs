@@ -19,6 +19,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use urlencoding::encode;
 mod akazeai;
+mod pagecodes;
 mod s3fs;
 mod sqliteutils;
 mod square;
@@ -28,6 +29,7 @@ use crate::s3fs::s3fs::{get_object, put_object};
 use crate::sqliteutils::sqliteutils::*;
 use crate::square::square::*;
 use crate::utils::utils::{parse_page_selection, save_as_webp};
+use crate::pagecodes::pagecodes::{analyse_scan, read_page_code, EditionInfo, ScannedPage, Slot, Summary};
 // Définition de la structure pour les arguments de ligne de commande
 /* #[derive(clap::Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -80,6 +82,11 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     dump_corners: Option<PathBuf>,
 
+    /// Tirages de l'examen en JSON (`[{"id":41,"copies":30,"pages_per_copy":2}]`) : lit les codes de page et
+    /// traite les pages dans l'ordre du tirage (T25d3). En mode file, ils viennent du message du back.
+    #[arg(long, default_value = "")]
+    page_codes: String,
+
     #[arg(long, action, default_value_t = false)]
     mq: bool, //allow debug
 
@@ -126,6 +133,10 @@ struct ScanRequest {
     corner_square_size: u32,
     #[serde(default = "default_min_radius")]
     min_radius: f32,
+    /// Tirages de l'examen (T25d3), renseignés par le back : non vide = lire les codes de page et traiter les
+    /// pages dans l'ordre attendu par le modèle (seulement pour un job qui couvre tout le scan).
+    #[serde(default)]
+    page_codes: Vec<EditionInfo>,
 }
 
 fn default_u32_one() -> u32 {
@@ -293,6 +304,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             args.minio_pass.as_str(),
             None,
             &args.mq_server_ouputqueue,
+            &page_codes_arg(&args.page_codes)?,
         )
         .await?;
     }
@@ -383,7 +395,8 @@ async fn process_exam(
     pass: &str,
     chan: Option<&Channel>,
     outputchan: &String,
-) -> Result<(), Box<dyn Error>> {
+    page_codes: &[EditionInfo],
+) -> Result<Option<Summary>, Box<dyn Error>> {
     println!("\n--- Traitement de l'exam : {} ---", exam_id);
     if pages_to_manage.len() > 0 {
         let existingcache = get_object(
@@ -445,7 +458,7 @@ async fn process_exam(
             fs::remove_file(format!("/tmp/{}.sqlite3", exam_id))?;
         }
 
-        return Ok(());
+        return Ok(None);
     }
     let templatedata = template?.bytes().to_vec();
     let cursor = Cursor::new(templatedata);
@@ -464,7 +477,7 @@ async fn process_exam(
             fs::remove_file(format!("/tmp/{}.sqlite3", exam_id))?;
         }
 
-        return Ok(());
+        return Ok(None);
     }
 
     let scan_data = scan?.bytes().to_vec();
@@ -555,18 +568,103 @@ async fn process_exam(
             let _ = save_as_webp(&template_imgd, output_path.as_path());
         }
     }
-    let mut realpage = 0;
-    // 4. Parcourir et traiter chaque page
-    for (index, page) in document_scan.pages().enumerate() {
-        let page_num = index + 1;
+    // 4. Ordre de traitement : celui du scan, ou celui des codes de page (T25d3) quand l'examen a été imprimé
+    //    depuis CorrectExam et que le job couvre tout le scan (les pages de sortie sont alors renumérotées).
+    let whole_scan = pages_to_manage.is_empty()
+        || (1..=page_count_scan as u32).all(|p| pages_to_manage.contains(&p));
+    let mut summary: Option<Summary> = None;
+    let plan: Vec<(usize, Slot)> = if !page_codes.is_empty() && whole_scan {
+        let mut scanned: Vec<ScannedPage> = Vec::with_capacity(page_count_scan as usize);
+        for index in 0..page_count_scan as i32 {
+            let scan_page = index as u32 + 1;
+            let read = document_scan
+                .page(index)
+                .ok()
+                .and_then(|page| render_page_at_height(&page, heightresolution).ok())
+                .and_then(|bitmap| bitmap.as_rgb8_image().ok())
+                .map(|img| read_page_code(&img, scan_page))
+                .unwrap_or(ScannedPage { scan_page, text: None, upside_down: false });
+            scanned.push(read);
+            // un statut régulier : le front abandonne un job silencieux
+            if let Some(channel) = chan {
+                if scan_page % 10 == 0 || scan_page == page_count_scan as u32 {
+                    let status = ScanStatus {
+                        exam_id,
+                        page: 0,
+                        status: "running".to_string(),
+                        progress: 0,
+                        details: format!("Lecture des codes de page {}/{}", scan_page, page_count_scan),
+                    };
+                    publish_status(channel, outputchan, &status).await?;
+                }
+            }
+        }
+        let report = analyse_scan(&scanned, page_codes);
+        let s = report.summary();
+        println!(
+            "    Codes de page : {} copies ({} complètes), {} blanche(s), {} retournée(s), {} illisible(s), ordre {}",
+            s.copies,
+            s.complete,
+            s.blanks,
+            s.upside_down.len(),
+            s.unreadable.len(),
+            if s.reordered { "corrigé" } else { "inchangé" }
+        );
+        summary = Some(s);
+        report.order.into_iter().enumerate().map(|(i, slot)| (i + 1, slot)).collect()
+    } else {
+        (1..=page_count_scan as usize)
+            .filter(|p| pages_to_manage.is_empty() || pages_to_manage.contains(&(*p as u32)))
+            .map(|p| (p, Slot::Scan { scan_page: p as u32, rotate: false }))
+            .collect()
+    };
+    if summary.is_some() {
+        // l'ordre de sortie diffère de celui du scan : aucune page d'un cache précédent ne doit subsister
+        clear_cache_pages(&conn)?;
+    }
 
-        if pages_to_manage.len() == 0 || pages_to_manage.contains(&(page_num as u32)) {
+    let mut realpage = 0;
+    for (page_num, slot) in plan.iter().copied() {
+        {
+            let (scan_index, rotate) = match slot {
+                Slot::Blank { .. } => {
+                    // page manquante : page blanche au format du modèle, déjà « alignée »
+                    let pagemod = page_mod(page_num, template_image_map.len()).unwrap() as u32;
+                    let blank = match template_image_map.get(&pagemod) {
+                        Some(t) => DynamicImage::ImageRgb8(image::RgbImage::from_pixel(t.width(), t.height(), image::Rgb([255, 255, 255]))),
+                        None => continue,
+                    };
+                    let _ = save_image_to_db_webp(&conn, &blank, &(page_num as i32), ImageState::NonAlign);
+                    let _ = save_image_to_db_webp(&conn, &blank, &(page_num as i32), ImageState::Align);
+                    println!("    -> Page blanche (page manquante) : {}", page_num);
+                    realpage += 1;
+                    if let Some(channel) = chan {
+                        let progress = ((realpage as f32 / plan.len() as f32) * 100.0) as u32;
+                        let status = ScanStatus {
+                            exam_id,
+                            page: page_num as u32,
+                            status: "running".to_string(),
+                            progress,
+                            details: format!("Page {} : page blanche", page_num),
+                        };
+                        publish_status(channel, outputchan, &status).await?;
+                    }
+                    continue;
+                }
+                Slot::Scan { scan_page, rotate } => (scan_page as i32 - 1, rotate),
+            };
             println!(
                 "  - Rendu et conversion de la page {}/{}...",
-                page_num, page_count_scan
+                scan_index + 1, page_count_scan
             );
 
-            let page = page.unwrap();
+            let page = match document_scan.page(scan_index) {
+                Ok(page) => page,
+                Err(_) => {
+                    println!("    ! Avertissement : page {} du scan illisible.", scan_index + 1);
+                    continue;
+                }
+            };
             let bitmap = render_page_at_height(&page, heightresolution).unwrap();
             // --- Remplacement ici : obtenir l'image en owned DynamicImage (mutable)
             let mut img = match bitmap.as_rgb8_image() {
@@ -579,6 +677,10 @@ async fn process_exam(
                     continue;
                 }
             };
+            if rotate {
+                // page numérisée à l'envers (code lu en haut de la page)
+                img = img.rotate180();
+            }
             dump_rendered_page(corner_dump_dir.as_ref(), &format!("scan_p{}", page_num), &page, &img);
 
             let _ = save_image_to_db_webp(&conn, &img, &(page_num as i32), ImageState::NonAlign);
@@ -803,10 +905,7 @@ async fn process_exam(
 
             if let Some(channel) = chan {
                 realpage = realpage + 1;
-                let mut numberpages = pages_to_manage.len();
-                if numberpages == 0 {
-                    numberpages = page_count_scan as usize;
-                }
+                let numberpages = plan.len().max(1);
                 let progress = ((realpage as f32 / numberpages as f32) * 100.0) as u32;
                 let routing_key = format!("scan.status.{}", exam_id);
                 let status_msg = ScanStatus {
@@ -855,7 +954,24 @@ async fn process_exam(
         }
     }
 
-    Ok(())
+    Ok(summary)
+}
+
+/// Tirages passés en ligne de commande (`--page-codes`), vide par défaut.
+fn page_codes_arg(json: &str) -> Result<Vec<EditionInfo>, Box<dyn Error>> {
+    if json.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(serde_json::from_str(json)?)
+}
+
+/// `details` du statut final : texte libre, ou le résumé des codes de page en JSON (`{"pagecodes": …}`, lu par le
+/// front) quand les pages ont été lues et ordonnées par leurs codes.
+fn finished_details(summary: &Option<Summary>) -> String {
+    match summary {
+        Some(s) => serde_json::json!({ "pagecodes": s }).to_string(),
+        None => "Traitement complet terminé".to_string(),
+    }
 }
 
 /// Publie un statut d'avancement sur l'exchange de sortie, avec la clé `scan.status.{exam_id}`.
@@ -958,7 +1074,7 @@ async fn run_job(
     }
     println!("  radius {}", request.min_radius);
 
-    process_exam(
+    let summary = process_exam(
         pages,
         request.exam_id,
         request.template_id,
@@ -980,6 +1096,7 @@ async fn run_job(
         pass,
         Some(channel),
         mq_server_ouputqueue,
+        &request.page_codes,
     )
     .await?;
 
@@ -989,7 +1106,7 @@ async fn run_job(
         page: 0,
         status: "finished".to_string(),
         progress: 100,
-        details: "Traitement complet terminé".to_string(),
+        details: finished_details(&summary),
     };
     publish_status(channel, mq_server_ouputqueue, &final_msg).await?;
 
@@ -1070,6 +1187,36 @@ mod tests {
         for field in ["exam_id", "page", "status", "progress", "details"] {
             assert!(json.get(field).is_some(), "missing field {}", field);
         }
+    }
+
+    #[test]
+    fn request_without_page_codes_is_still_accepted() {
+        let r: ScanRequest = serde_json::from_str(r#"{"pages_to_manage":"1-4","exam_id":3}"#).unwrap();
+        assert!(r.page_codes.is_empty());
+    }
+
+    #[test]
+    fn page_codes_sent_by_the_back_are_read() {
+        let r: ScanRequest = serde_json::from_str(
+            r#"{"pages_to_manage":"1-4","exam_id":3,"page_codes":[{"id":41,"copies":30,"pages_per_copy":2}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.page_codes, vec![EditionInfo { id: 41, copies: 30, pages_per_copy: 2 }]);
+        assert_eq!(page_codes_arg(r#"[{"id":41,"copies":30,"pages_per_copy":2}]"#).unwrap(), r.page_codes);
+        assert!(page_codes_arg("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn finished_details_carry_the_page_code_summary() {
+        assert_eq!(finished_details(&None), "Traitement complet terminé");
+        let report = crate::pagecodes::pagecodes::analyse_scan(
+            &[ScannedPage { scan_page: 1, text: Some("CE1|41|1|1".into()), upside_down: false }],
+            &[EditionInfo { id: 41, copies: 30, pages_per_copy: 2 }],
+        );
+        let json: serde_json::Value = serde_json::from_str(&finished_details(&Some(report.summary()))).unwrap();
+        assert_eq!(json["pagecodes"]["copies"], 1);
+        assert_eq!(json["pagecodes"]["blanks"], 1);
+        assert_eq!(json["pagecodes"]["incomplete"][0]["missing"][0], 2);
     }
 
     #[test]
