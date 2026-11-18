@@ -24,12 +24,14 @@ mod s3fs;
 mod sqliteutils;
 mod square;
 mod utils;
+mod versions;
 use crate::akazeai::akazeai::deskew_constrained;
 use crate::s3fs::s3fs::{get_object, put_object};
 use crate::sqliteutils::sqliteutils::*;
 use crate::square::square::*;
 use crate::utils::utils::{parse_page_selection, save_as_webp};
 use crate::pagecodes::pagecodes::{analyse_scan, read_page_code, EditionInfo, ScannedPage, Slot, Summary};
+use crate::versions::versions::{applies as versions_apply, rebuild_cache, ExamVersion, RebuildSummary};
 // Définition de la structure pour les arguments de ligne de commande
 /* #[derive(clap::Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -87,6 +89,12 @@ struct Args {
     #[arg(long, default_value = "")]
     page_codes: String,
 
+    /// Versions de l'examen en JSON (`[{"index":0,"label":"A","layout":{…}}, …]`) : avec un tirage à plusieurs
+    /// versions, les copies des versions B, C… sont reconstruites dans la mise en page de A (T25e). En mode file,
+    /// elles viennent du message du back.
+    #[arg(long, default_value = "")]
+    versions: String,
+
     #[arg(long, action, default_value_t = false)]
     mq: bool, //allow debug
 
@@ -137,6 +145,10 @@ struct ScanRequest {
     /// pages dans l'ordre attendu par le modèle (seulement pour un job qui couvre tout le scan).
     #[serde(default)]
     page_codes: Vec<EditionInfo>,
+    /// Versions de l'examen (T25e), renseignées par le back quand un tirage a plusieurs versions : mise en page de
+    /// chaque version pour reconstruire les copies des versions B, C… dans celle de A.
+    #[serde(default)]
+    versions: Vec<ExamVersion>,
 }
 
 fn default_u32_one() -> u32 {
@@ -305,6 +317,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             None,
             &args.mq_server_ouputqueue,
             &page_codes_arg(&args.page_codes)?,
+            &versions_arg(&args.versions)?,
         )
         .await?;
     }
@@ -396,7 +409,8 @@ async fn process_exam(
     chan: Option<&Channel>,
     outputchan: &String,
     page_codes: &[EditionInfo],
-) -> Result<Option<Summary>, Box<dyn Error>> {
+    versions: &[ExamVersion],
+) -> Result<(Option<Summary>, Option<RebuildSummary>), Box<dyn Error>> {
     println!("\n--- Traitement de l'exam : {} ---", exam_id);
     if pages_to_manage.len() > 0 {
         let existingcache = get_object(
@@ -458,7 +472,7 @@ async fn process_exam(
             fs::remove_file(format!("/tmp/{}.sqlite3", exam_id))?;
         }
 
-        return Ok(None);
+        return Ok((None, None));
     }
     let templatedata = template?.bytes().to_vec();
     let cursor = Cursor::new(templatedata);
@@ -477,7 +491,7 @@ async fn process_exam(
             fs::remove_file(format!("/tmp/{}.sqlite3", exam_id))?;
         }
 
-        return Ok(None);
+        return Ok((None, None));
     }
 
     let scan_data = scan?.bytes().to_vec();
@@ -930,6 +944,41 @@ async fn process_exam(
     }
     drop(document_scan); // Demonstrate that the page can be used after the document is dropped.
     drop(document_template); // Demonstrate that the page can be used after the document is dropped.
+
+    // 5. Copies des versions B, C… reconstruites dans la mise en page de la version A (T25e, ADR 0005)
+    let mut rebuilt: Option<RebuildSummary> = None;
+    if versions_apply(page_codes, versions) {
+        if let Some(channel) = chan {
+            let status = ScanStatus {
+                exam_id,
+                page: 0,
+                status: "running".to_string(),
+                // pas 100 : le front tient le job pour terminé dès 100, avant l'envoi du cache
+                progress: 99,
+                details: "Reconstruction des copies des versions B, C…".to_string(),
+            };
+            publish_status(channel, outputchan, &status).await?;
+        }
+        match rebuild_cache(&conn, page_codes, versions, &template_image_map, |done, total| {
+            if done % 10 == 0 || done == total {
+                println!("    Reconstruction : {}/{} copies", done, total);
+            }
+        }) {
+            Ok(r) => {
+                println!(
+                    "    Versions : {} copies, {} reconstruites, {} en version A, {} déjà reconstruites, {} non reconstruites",
+                    r.copies,
+                    r.rebuilt.len(),
+                    r.version_a,
+                    r.already_rebuilt,
+                    r.not_rebuilt.len()
+                );
+                rebuilt = Some(r);
+            }
+            // les pages alignées restent telles quelles : le front signale les copies non reconstruites
+            Err(e) => eprintln!("    ! Reconstruction des versions impossible : {}", e),
+        }
+    }
     
     let _ = update_dt(&conn);
     
@@ -954,7 +1003,15 @@ async fn process_exam(
         }
     }
 
-    Ok(summary)
+    Ok((summary, rebuilt))
+}
+
+/// Versions passées en ligne de commande (`--versions`), vide par défaut.
+fn versions_arg(json: &str) -> Result<Vec<ExamVersion>, Box<dyn Error>> {
+    if json.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(serde_json::from_str(json)?)
 }
 
 /// Tirages passés en ligne de commande (`--page-codes`), vide par défaut.
@@ -966,12 +1023,20 @@ fn page_codes_arg(json: &str) -> Result<Vec<EditionInfo>, Box<dyn Error>> {
 }
 
 /// `details` du statut final : texte libre, ou le résumé des codes de page en JSON (`{"pagecodes": …}`, lu par le
-/// front) quand les pages ont été lues et ordonnées par leurs codes.
-fn finished_details(summary: &Option<Summary>) -> String {
-    match summary {
-        Some(s) => serde_json::json!({ "pagecodes": s }).to_string(),
-        None => "Traitement complet terminé".to_string(),
+/// front) quand les pages ont été lues et ordonnées par leurs codes, et le bilan des copies reconstruites
+/// (`{"versions": …}`, T25e) quand l'examen a des tirages à plusieurs versions.
+fn finished_details(summary: &Option<Summary>, rebuilt: &Option<RebuildSummary>) -> String {
+    if summary.is_none() && rebuilt.is_none() {
+        return "Traitement complet terminé".to_string();
     }
+    let mut details = serde_json::Map::new();
+    if let Some(s) = summary {
+        details.insert("pagecodes".into(), serde_json::json!(s));
+    }
+    if let Some(r) = rebuilt {
+        details.insert("versions".into(), serde_json::json!(r));
+    }
+    serde_json::Value::Object(details).to_string()
 }
 
 /// Publie un statut d'avancement sur l'exchange de sortie, avec la clé `scan.status.{exam_id}`.
@@ -1074,7 +1139,7 @@ async fn run_job(
     }
     println!("  radius {}", request.min_radius);
 
-    let summary = process_exam(
+    let (summary, rebuilt) = process_exam(
         pages,
         request.exam_id,
         request.template_id,
@@ -1097,6 +1162,7 @@ async fn run_job(
         Some(channel),
         mq_server_ouputqueue,
         &request.page_codes,
+        &request.versions,
     )
     .await?;
 
@@ -1106,7 +1172,7 @@ async fn run_job(
         page: 0,
         status: "finished".to_string(),
         progress: 100,
-        details: finished_details(&summary),
+        details: finished_details(&summary, &rebuilt),
     };
     publish_status(channel, mq_server_ouputqueue, &final_msg).await?;
 
@@ -1201,19 +1267,47 @@ mod tests {
             r#"{"pages_to_manage":"1-4","exam_id":3,"page_codes":[{"id":41,"copies":30,"pages_per_copy":2}]}"#,
         )
         .unwrap();
-        assert_eq!(r.page_codes, vec![EditionInfo { id: 41, copies: 30, pages_per_copy: 2 }]);
+        assert_eq!(r.page_codes, vec![EditionInfo { id: 41, copies: 30, pages_per_copy: 2, versions: 1 }]);
         assert_eq!(page_codes_arg(r#"[{"id":41,"copies":30,"pages_per_copy":2}]"#).unwrap(), r.page_codes);
         assert!(page_codes_arg("").unwrap().is_empty());
     }
 
     #[test]
+    fn versions_sent_by_the_back_are_read() {
+        let r: ScanRequest = serde_json::from_str(
+            r#"{"pages_to_manage":"1-4","exam_id":3,
+                "page_codes":[{"id":41,"copies":30,"pages_per_copy":2,"versions":3}],
+                "versions":[{"index":1,"label":"B","layout":{"format":1,"version":1,"label":"B","pages":2,
+                  "parts":[{"key":"q1","part":1,"zone":{"pageNumber":2,"xInit":100,"yInit":200,"width":300,"height":400}}],
+                  "boxes":[],"identity":{"lastname":{"pageNumber":1,"xInit":1,"yInit":2,"width":3,"height":4}}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.page_codes[0].versions, 3);
+        assert_eq!(r.versions[0].label, "B");
+        assert_eq!(r.versions[0].layout.parts[0].zone.page_number, Some(2.0));
+        assert!(r.versions[0].layout.identity.contains_key("lastname"));
+        let old: ScanRequest = serde_json::from_str(r#"{"pages_to_manage":"1-4"}"#).unwrap();
+        assert!(old.versions.is_empty());
+        assert!(versions_arg("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn finished_details_carry_the_rebuild_summary() {
+        let r = RebuildSummary { copies: 3, version_a: 1, ..Default::default() };
+        let json: serde_json::Value = serde_json::from_str(&finished_details(&None, &Some(r))).unwrap();
+        assert_eq!(json["versions"]["copies"], 3);
+        assert_eq!(json["versions"]["version_a"], 1);
+        assert!(json.get("pagecodes").is_none());
+    }
+
+    #[test]
     fn finished_details_carry_the_page_code_summary() {
-        assert_eq!(finished_details(&None), "Traitement complet terminé");
+        assert_eq!(finished_details(&None, &None), "Traitement complet terminé");
         let report = crate::pagecodes::pagecodes::analyse_scan(
             &[ScannedPage { scan_page: 1, text: Some("CE1|41|1|1".into()), upside_down: false }],
-            &[EditionInfo { id: 41, copies: 30, pages_per_copy: 2 }],
+            &[EditionInfo { id: 41, copies: 30, pages_per_copy: 2, versions: 1 }],
         );
-        let json: serde_json::Value = serde_json::from_str(&finished_details(&Some(report.summary()))).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&finished_details(&Some(report.summary()), &None)).unwrap();
         assert_eq!(json["pagecodes"]["copies"], 1);
         assert_eq!(json["pagecodes"]["blanks"], 1);
         assert_eq!(json["pagecodes"]["incomplete"][0]["missing"][0], 2);
