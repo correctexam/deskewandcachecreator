@@ -18,6 +18,13 @@ pub struct EditionInfo {
     pub id: u64,
     pub copies: u32,
     pub pages_per_copy: u32,
+    /// Versions du sujet dans le tirage (T25e) : la copie c est imprimée dans la version (c − 1) mod versions.
+    #[serde(default = "one_version")]
+    pub versions: u32,
+}
+
+fn one_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -268,7 +275,7 @@ mod tests {
     use image::{ImageBuffer, Luma};
     use rxing::Writer;
 
-    const EDITIONS: [EditionInfo; 1] = [EditionInfo { id: 12, copies: 30, pages_per_copy: 2 }];
+    const EDITIONS: [EditionInfo; 1] = [EditionInfo { id: 12, copies: 30, pages_per_copy: 2, versions: 1 }];
 
     fn scan(texts: &[Option<&str>]) -> Vec<ScannedPage> {
         texts

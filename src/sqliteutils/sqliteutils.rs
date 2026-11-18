@@ -18,6 +18,10 @@ pub enum ImageState {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Document {
     pub pages: String,
+    /// Lettre de la version d'où la page a été reconstruite (T25e) ; absente pour une page alignée telle quelle.
+    /// Même marque que le front : une page marquée n'est jamais reconstruite deux fois.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub rebuilt: Option<String>,
 }
 
 const WEBP_DATA_PREFIX: &str = "data:image/webp;base64,";
@@ -100,12 +104,44 @@ fn create_table(conn: &Connection, exam_id: u32) -> Result<(), rusqlite::Error> 
     Ok(())
 }
 
+/// Pages alignées du cache, dans l'ordre (numéros à partir de 1).
+pub fn align_pages(conn: &Connection) -> Result<Vec<i32>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT page FROM align ORDER BY page")?;
+    let rows = stmt.query_map([], |row| row.get::<_, i32>(0))?;
+    rows.collect()
+}
+
+/// Page alignée du cache : image décodée et marque de reconstruction.
+pub fn read_align_page(conn: &Connection, page: i32) -> Result<Option<(DynamicImage, Option<String>)>, Box<dyn std::error::Error>> {
+    let json: Option<String> = conn
+        .query_row("SELECT imageData FROM align WHERE page = ?1", params![page], |row| row.get(0))
+        .ok();
+    let Some(json) = json else {
+        return Ok(None);
+    };
+    let doc: Document = serde_json::from_str(&json)?;
+    let b64 = doc.pages.split_once(',').map(|(_, d)| d).unwrap_or(&doc.pages);
+    let bytes = general_purpose::STANDARD.decode(b64)?;
+    Ok(Some((image::load_from_memory(&bytes)?, doc.rebuilt)))
+}
+
 /// Convertit l'image en octets (WebP) et l'insère en BLOB
 pub fn save_image_to_db_webp(
     conn: &Connection,
     img: &DynamicImage,
     page: &i32,
     state: ImageState
+) -> Result<(), rusqlite::Error> {
+    save_image_to_db_webp_marked(conn, img, page, state, None)
+}
+
+/// Comme `save_image_to_db_webp`, avec la marque d'une page reconstruite (T25e).
+pub fn save_image_to_db_webp_marked(
+    conn: &Connection,
+    img: &DynamicImage,
+    page: &i32,
+    state: ImageState,
+    rebuilt: Option<String>,
 ) -> Result<(), rusqlite::Error> {
     // --- 1. Préparation des données pour l'encodeur WebP ---
     // L'encodeur webp prend des données Rgba8 ou Rgb8.
@@ -139,6 +175,7 @@ pub fn save_image_to_db_webp(
 
     let doc = Document {
         pages: final_data_url,
+        rebuilt,
     };
 
     // 2. Sérialisation en JSON (Struct -> String JSON)
