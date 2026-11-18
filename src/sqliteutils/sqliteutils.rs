@@ -40,6 +40,14 @@ pub fn update_dt(conn : &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Supprime les pages du scan (alignées ou non) d'un cache existant ; le modèle est conservé.
+/// Utilisé quand les pages sont renumérotées d'après leurs codes (T25d3).
+pub fn clear_cache_pages(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute("DELETE FROM align", [])?;
+    conn.execute("DELETE FROM nonalign", [])?;
+    Ok(())
+}
+
 /// Crée la table (structure identique)
 pub fn close_connection(conn: Connection) -> Result<(), rusqlite::Error> {
     let _ = conn.close();
