@@ -309,6 +309,20 @@ pub struct RebuildSummary {
     pub already_rebuilt: usize,
     pub rebuilt: Vec<RebuiltCopy>,
     pub not_rebuilt: Vec<NotRebuilt>,
+    /// Version de chaque copie dont la version est connue (A, reconstruites, déjà reconstruites), pour les
+    /// statistiques par version (T25e6b) ; le front l'enregistre dans le back.
+    #[serde(default)]
+    pub copy_versions: Vec<CopyVersionEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopyVersionEntry {
+    pub first_page: u32,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub edition: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub copy: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -382,15 +396,20 @@ fn rebuild_slot(
     }
     let mut images = Vec::with_capacity(n as usize);
     let mut marked = 0;
+    let mut mark: Option<String> = None;
     for p in slot.first_page..slot.first_page + n {
         let (img, rebuilt) = read_align_page(conn, p as i32)?.ok_or_else(|| format!("page alignée {} absente", p))?;
         if rebuilt.is_some() {
             marked += 1;
+            mark = rebuilt;
         }
         images.push(img);
     }
     if marked == images.len() {
         summary.already_rebuilt += 1;
+        if let Some(label) = mark {
+            summary.copy_versions.push(CopyVersionEntry { first_page: slot.first_page, label, edition: None, copy: None });
+        }
         return Ok(());
     }
     if marked > 0 {
@@ -418,6 +437,8 @@ fn rebuild_slot(
     };
     if version == 0 {
         summary.version_a += 1;
+        let label = versions.iter().find(|v| v.index == 0).map(|v| v.label.clone()).unwrap_or_else(|| "A".into());
+        summary.copy_versions.push(CopyVersionEntry { first_page: slot.first_page, label, edition: Some(edition), copy: Some(copy) });
         return Ok(());
     }
     let Some(layout) = versions.iter().find(|v| v.index == version) else {
@@ -432,6 +453,12 @@ fn rebuild_slot(
         save_image_to_db_webp_marked(conn, &img, &((slot.first_page + j as u32) as i32), ImageState::Align, Some(layout.label.clone()))?;
     }
     println!("    -> Copie {} (tirage {}) reconstruite depuis la version {}", copy, edition, layout.label);
+    summary.copy_versions.push(CopyVersionEntry {
+        first_page: slot.first_page,
+        label: layout.label.clone(),
+        edition: Some(edition),
+        copy: Some(copy),
+    });
     summary.rebuilt.push(RebuiltCopy { first_page: slot.first_page, edition, copy, label: layout.label.clone(), issues });
     Ok(())
 }
@@ -672,6 +699,10 @@ mod tests {
         assert_eq!(summary.copies, 2);
         assert_eq!(summary.version_a, 1);
         assert_eq!(summary.rebuilt.len(), 1, "{:?}", summary);
+        assert_eq!(
+            summary.copy_versions.iter().map(|c| (c.first_page, c.label.as_str(), c.copy)).collect::<Vec<_>>(),
+            vec![(1, "A", Some(1)), (3, "B", Some(2))]
+        );
         assert_eq!((summary.rebuilt[0].first_page, summary.rebuilt[0].copy, summary.rebuilt[0].label.as_str()), (3, 2, "B"));
         // page 3 reconstruite : l'encre de la page 2 de B est à la place de q1 dans A (page 1 de la copie)
         let (p3, mark) = read_align_page(&conn, 3).unwrap().unwrap();
@@ -684,6 +715,10 @@ mod tests {
 
         let again = rebuild_cache(&conn, &editions, &versions, &templates, |_, _| {}).unwrap();
         assert_eq!((again.already_rebuilt, again.version_a, again.rebuilt.len()), (1, 1, 0));
+        assert_eq!(
+            again.copy_versions.iter().map(|c| (c.first_page, c.label.as_str(), c.copy)).collect::<Vec<_>>(),
+            vec![(1, "A", Some(1)), (3, "B", None)]
+        );
         let _ = std::fs::remove_file(format!("/tmp/{}.sqlite3", exam_id));
     }
 
